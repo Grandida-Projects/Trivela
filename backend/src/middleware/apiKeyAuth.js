@@ -60,7 +60,11 @@ export default function createApiKeyAuth({
 
     const provided = readProvidedKey(req);
 
-    if (provided && allowedKeySet.has(provided)) {
+    if (provided === apiKey) {
+      req.auth = {
+        type: 'apiKey',
+        apiKey: String(provided),
+      };
       return next();
     }
 
