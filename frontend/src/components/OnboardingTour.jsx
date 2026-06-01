@@ -1,24 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import { driver } from 'driver.js';
 import 'driver.js/dist/driver.css';
-import { useTour } from '../hooks/useTour.js';
+
+const TOUR_KEY = 'trivela:tour_completed';
 
 const TOUR_STEPS = [
   {
     popover: {
       title: 'Welcome to Trivela',
       description:
-        'Trivela is a Stellar-powered campaign platform where you complete tasks and earn on-chain rewards. Let us show you around.',
+        'Trivela is a Stellar-powered campaign platform where you can discover, register, and earn rewards. Let us show you around.',
       side: 'bottom',
       align: 'center',
     },
   },
   {
-    element: '[data-tour="campaign-grid"]',
+    element: '[data-tour="campaigns"]',
     popover: {
       title: 'Browse Campaigns',
       description:
-        'These are the active campaigns. Each card shows the name, reward, and available spots. Click any card to see full details.',
+        'Explore active campaigns here. Filter by category, sort by newest or reward size, and find ones that match your interests.',
       side: 'bottom',
       align: 'start',
     },
@@ -28,35 +29,34 @@ const TOUR_STEPS = [
     popover: {
       title: 'Connect Your Wallet',
       description:
-        'Use a Stellar-compatible wallet (e.g. Freighter) to connect. Your wallet address identifies you on-chain so rewards are sent directly to you.',
+        'Connect your Freighter wallet to participate in campaigns and track your XLM balance and reward points.',
       side: 'bottom',
       align: 'end',
     },
   },
   {
-    element: '[data-tour="campaign-register"]',
+    element: '[data-tour="campaigns"]',
     popover: {
       title: 'Register & Earn',
       description:
-        'Once connected, click Register on any active campaign. Your on-chain registration is recorded immediately and points start accumulating.',
+        'Click any campaign card to see details and register. Each action you complete earns reward points recorded on the Stellar blockchain.',
       side: 'bottom',
       align: 'start',
     },
   },
   {
-    element: '[data-tour="rewards-display"]',
+    element: '[data-tour="rewards"]',
     popover: {
       title: 'Track Your Rewards',
       description:
-        'Your earned points and reward balance appear here after you register. Claim them from the campaign detail page at any time.',
+        "Your accumulated reward points are shown here once your wallet is connected. You can claim them via the smart contract at any time.",
       side: 'bottom',
       align: 'end',
     },
   },
 ];
 
-export default function OnboardingTour({ onComplete, onRestart }) {
-  const { shouldShow, markComplete } = useTour();
+export default function OnboardingTour({ onRestart }) {
   const driverRef = useRef(null);
   const [ready, setReady] = useState(false);
 
@@ -74,8 +74,7 @@ export default function OnboardingTour({ onComplete, onRestart }) {
       doneBtnText: 'Finish',
       steps: TOUR_STEPS,
       onDestroyed: () => {
-        markComplete();
-        if (onComplete) onComplete();
+        localStorage.setItem(TOUR_KEY, 'true');
       },
     });
 
@@ -84,13 +83,15 @@ export default function OnboardingTour({ onComplete, onRestart }) {
   };
 
   useEffect(() => {
-    if (!shouldShow) return;
-    const timeout = setTimeout(() => {
-      setReady(true);
-      startTour();
-    }, 600);
-    return () => clearTimeout(timeout);
-  }, [shouldShow]);
+    const completed = localStorage.getItem(TOUR_KEY);
+    if (!completed) {
+      const timeout = setTimeout(() => {
+        setReady(true);
+        startTour();
+      }, 600);
+      return () => clearTimeout(timeout);
+    }
+  }, []);
 
   useEffect(() => {
     if (onRestart) {
