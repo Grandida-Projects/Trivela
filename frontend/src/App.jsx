@@ -257,11 +257,6 @@ export default function App() {
           />
         }
       />
-      </Routes>
-    </>
-      {/* #295 — Per-wallet transaction history. Renders empty / loading
-          / error states inline so the page never depends on the caller
-          to wrap. */}
       <Route
         path="/history"
         element={
@@ -280,5 +275,6 @@ export default function App() {
         }
       />
     </Routes>
+  </>
   );
 }
