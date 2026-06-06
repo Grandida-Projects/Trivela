@@ -87,6 +87,9 @@ jobs:
             echo "No lint script; skipping."
           fi
 
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
       - name: Test frontend
         run: |
           if npm --workspace=frontend run | grep -q "  test"; then
