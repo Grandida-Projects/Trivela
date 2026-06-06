@@ -638,23 +638,20 @@ fn test_tiered_rewards_sorting_and_credit() {
     assert_eq!(client.get_tier_for_rank(&21, &1u64), 10);
     assert_eq!(client.get_tier_for_rank(&100, &1u64), 10);
 
-    // Credit user by rank 5 (gets 100 points)
+    // Credit user by rank 5 (gets 100 points).
+    // `env.events().all()` reflects events from the most recent invocation, so
+    // we assert it right after `credit_by_rank` (before any further client
+    // calls, including the `balance` view call). That single invocation emits
+    // the inner `credit` event followed by the `tier_credit` event — the
+    // earlier `set_tiers` event belongs to a prior, separate invocation.
     let balance = client.credit_by_rank(&admin, &user, &5u64, &1u64);
     assert_eq!(balance, 100);
-    assert_eq!(client.balance(&user), 100);
 
-    // Verify events
-    let set_tiers_event = Symbol::new(&env, "set_tiers");
     let tier_credit_event = Symbol::new(&env, "tier_credit");
     assert_eq!(
         env.events().all(),
         vec![
             &env,
-            (
-                contract_id.clone(),
-                vec![&env, set_tiers_event.into_val(&env), 1u64.into_val(&env)],
-                ().into_val(&env)
-            ),
             (
                 contract_id.clone(),
                 vec![
@@ -675,6 +672,8 @@ fn test_tiered_rewards_sorting_and_credit() {
             )
         ]
     );
+
+    assert_eq!(client.balance(&user), 100);
 
     // Credit user by rank 25 (gets 10 points)
     let balance = client.credit_by_rank(&admin, &user, &25u64, &1u64);

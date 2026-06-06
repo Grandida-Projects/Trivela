@@ -607,7 +607,9 @@ impl RewardsContract {
         rank: u64,
         campaign_id: u64,
     ) -> Result<u64, Error> {
-        from.require_auth();
+        // `Self::credit` below already calls `from.require_auth()`; calling it
+        // again here would double-authorize the same address in one frame and
+        // trip the host's `Auth(ExistingValue)` guard.
         ensure_not_paused(&env)?;
 
         let points = Self::get_tier_for_rank(env.clone(), rank, campaign_id);

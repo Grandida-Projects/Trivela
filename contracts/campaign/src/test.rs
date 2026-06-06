@@ -583,27 +583,15 @@ fn test_deregister_success_and_re_register() {
     assert!(client.is_participant(&participant));
     assert_eq!(client.get_participant_count(), 1);
 
-    // Deregister participant
+    // Deregister participant.
+    // `env.events().all()` reflects events from the most recent invocation,
+    // so we assert it right after `deregister` (before any further client calls).
     assert!(client.deregister(&participant));
-    assert!(!client.is_participant(&participant));
-    assert_eq!(client.get_participant_count(), 0);
-
-    // Check deregister event
-    let register_event = Symbol::new(&env, "register");
     let deregister_event = Symbol::new(&env, "deregister");
     assert_eq!(
         env.events().all(),
         vec![
             &env,
-            (
-                contract_id.clone(),
-                vec![
-                    &env,
-                    register_event.into_val(&env),
-                    participant.clone().into_val(&env)
-                ],
-                ().into_val(&env)
-            ),
             (
                 contract_id.clone(),
                 vec![
@@ -615,6 +603,9 @@ fn test_deregister_success_and_re_register() {
             )
         ]
     );
+
+    assert!(!client.is_participant(&participant));
+    assert_eq!(client.get_participant_count(), 0);
 
     // Re-register works
     assert!(client.register(&participant, &leaf, &proof, &None));
@@ -637,27 +628,15 @@ fn test_admin_deregister() {
     assert!(client.is_participant(&participant));
     assert_eq!(client.get_participant_count(), 1);
 
-    // Admin deregister
+    // Admin deregister.
+    // `env.events().all()` reflects events from the most recent invocation,
+    // so we assert it right after `admin_deregister` (before any further client calls).
     assert!(client.admin_deregister(&admin, &0, &participant));
-    assert!(!client.is_participant(&participant));
-    assert_eq!(client.get_participant_count(), 0);
-
-    // Check deregister event
-    let register_event = Symbol::new(&env, "register");
     let deregister_event = Symbol::new(&env, "deregister");
     assert_eq!(
         env.events().all(),
         vec![
             &env,
-            (
-                contract_id.clone(),
-                vec![
-                    &env,
-                    register_event.into_val(&env),
-                    participant.clone().into_val(&env)
-                ],
-                ().into_val(&env)
-            ),
             (
                 contract_id.clone(),
                 vec![
@@ -669,6 +648,9 @@ fn test_admin_deregister() {
             )
         ]
     );
+
+    assert!(!client.is_participant(&participant));
+    assert_eq!(client.get_participant_count(), 0);
 
     // Call admin deregister again for same participant (should return false and not panic)
     assert!(!client.admin_deregister(&admin, &1, &participant));

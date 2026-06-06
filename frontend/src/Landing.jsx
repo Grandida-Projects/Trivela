@@ -120,7 +120,7 @@ export default function Landing({
       })
       .then((payload) => {
         if (controller.signal.aborted) return;
-        const items = Array.isArray(payload) ? payload : payload.data ?? payload.campaigns ?? [];
+        const items = Array.isArray(payload) ? payload : (payload.data ?? payload.campaigns ?? []);
         logSafeEvent('campaigns_list_loaded', { count: items.length });
         const nextPagination = Array.isArray(payload)
           ? getFallbackPagination(items, campaignPage)
