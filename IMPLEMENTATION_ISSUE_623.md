@@ -2,7 +2,9 @@
 
 ## Overview
 
-This implementation adds a comprehensive cohort and retention analysis API to the Trivela platform, enabling campaign operators to answer questions like "of users who registered in week N, how many claimed by week N+k?"
+This implementation adds a comprehensive cohort and retention analysis API to the Trivela platform,
+enabling campaign operators to answer questions like "of users who registered in week N, how many
+claimed by week N+k?"
 
 ## Features Implemented
 
@@ -38,7 +40,8 @@ All endpoints under `/api/v1/campaigns/:campaignId/cohorts` (requires API key):
 
 - `GET /campaigns/:campaignId/cohorts` - Get full cohort analysis with retention curves
   - Query params: `granularity` (day/week/month), `metric` (claimed/active), `recompute` (bool)
-- `GET /campaigns/:campaignId/cohorts/:cohortPeriod/retention` - Get retention curve for specific cohort
+- `GET /campaigns/:campaignId/cohorts/:cohortPeriod/retention` - Get retention curve for specific
+  cohort
   - Query params: `granularity`, `metric`
 
 #### Recomputation
@@ -62,7 +65,8 @@ All endpoints under `/api/v1/campaigns/:campaignId/cohorts` (requires API key):
 
 ### Cohort Definition
 
-A **cohort** is a group of users who registered in the same time period (day, week, or month). Cohorts are identified by period strings:
+A **cohort** is a group of users who registered in the same time period (day, week, or month).
+Cohorts are identified by period strings:
 
 - Day: `2024-01-15`
 - Week: `2024-W03` (ISO week number)
@@ -70,7 +74,8 @@ A **cohort** is a group of users who registered in the same time period (day, we
 
 ### Retention Calculation
 
-**Retention** measures how many users from a cohort performed an activity at a given offset from their registration:
+**Retention** measures how many users from a cohort performed an activity at a given offset from
+their registration:
 
 - Offset 0: Same period as registration
 - Offset 1: One period later
@@ -130,8 +135,8 @@ curl "http://localhost:3001/api/v1/campaigns/1/cohorts?granularity=week&metric=c
       "periodEnd": "2024-01-08T00:00:00.000Z",
       "retention": [
         { "offset": 0, "userCount": 100, "retentionRate": 66.67 },
-        { "offset": 1, "userCount": 75, "retentionRate": 50.00 },
-        { "offset": 2, "userCount": 45, "retentionRate": 30.00 }
+        { "offset": 1, "userCount": 75, "retentionRate": 50.0 },
+        { "offset": 2, "userCount": 45, "retentionRate": 30.0 }
       ]
     },
     {
@@ -140,8 +145,8 @@ curl "http://localhost:3001/api/v1/campaigns/1/cohorts?granularity=week&metric=c
       "periodStart": "2024-01-08T00:00:00.000Z",
       "periodEnd": "2024-01-15T00:00:00.000Z",
       "retention": [
-        { "offset": 0, "userCount": 140, "retentionRate": 70.00 },
-        { "offset": 1, "userCount": 100, "retentionRate": 50.00 }
+        { "offset": 0, "userCount": 140, "retentionRate": 70.0 },
+        { "offset": 1, "userCount": 100, "retentionRate": 50.0 }
       ]
     }
   ]
@@ -172,9 +177,9 @@ curl "http://localhost:3001/api/v1/campaigns/1/cohorts/2024-W01/retention?granul
   "cohortSize": 150,
   "retention": [
     { "offset": 0, "userCount": 100, "retentionRate": 66.67 },
-    { "offset": 1, "userCount": 75, "retentionRate": 50.00 },
-    { "offset": 2, "userCount": 45, "retentionRate": 30.00 },
-    { "offset": 3, "userCount": 30, "retentionRate": 20.00 }
+    { "offset": 1, "userCount": 75, "retentionRate": 50.0 },
+    { "offset": 2, "userCount": 45, "retentionRate": 30.0 },
+    { "offset": 3, "userCount": 30, "retentionRate": 20.0 }
   ]
 }
 ```
@@ -215,17 +220,17 @@ curl -X POST "http://localhost:3001/api/v1/campaigns/1/activities" \
 
 ### user_activities
 
-| Column         | Type    | Description                                      |
-| -------------- | ------- | ------------------------------------------------ |
-| id             | INTEGER | Primary key                                      |
-| campaign_id    | INTEGER | Foreign key to campaigns                         |
-| user_address   | TEXT    | User identifier (wallet address)                 |
-| activity_type  | TEXT    | 'registered', 'claimed', 'active'                |
-| occurred_at    | TEXT    | ISO 8601 timestamp (UTC)                         |
-| ledger         | INTEGER | Optional: on-chain ledger number                 |
-| tx_hash        | TEXT    | Optional: transaction hash                       |
-| metadata       | TEXT    | JSON blob for additional context                 |
-| created_at     | TEXT    | Record creation timestamp                        |
+| Column        | Type    | Description                       |
+| ------------- | ------- | --------------------------------- |
+| id            | INTEGER | Primary key                       |
+| campaign_id   | INTEGER | Foreign key to campaigns          |
+| user_address  | TEXT    | User identifier (wallet address)  |
+| activity_type | TEXT    | 'registered', 'claimed', 'active' |
+| occurred_at   | TEXT    | ISO 8601 timestamp (UTC)          |
+| ledger        | INTEGER | Optional: on-chain ledger number  |
+| tx_hash       | TEXT    | Optional: transaction hash        |
+| metadata      | TEXT    | JSON blob for additional context  |
+| created_at    | TEXT    | Record creation timestamp         |
 
 **Indexes:**
 
@@ -237,31 +242,31 @@ curl -X POST "http://localhost:3001/api/v1/campaigns/1/activities" \
 
 ### cohort_stats
 
-| Column        | Type    | Description                             |
-| ------------- | ------- | --------------------------------------- |
-| id            | INTEGER | Primary key                             |
-| campaign_id   | INTEGER | Foreign key to campaigns                |
-| cohort_period | TEXT    | Period identifier (e.g., '2024-W01')    |
-| cohort_size   | INTEGER | Number of users in cohort               |
-| granularity   | TEXT    | 'day', 'week', 'month'                  |
-| period_start  | TEXT    | ISO 8601 timestamp (period start)       |
-| period_end    | TEXT    | ISO 8601 timestamp (period end)         |
-| computed_at   | TEXT    | When this was computed                  |
+| Column        | Type    | Description                          |
+| ------------- | ------- | ------------------------------------ |
+| id            | INTEGER | Primary key                          |
+| campaign_id   | INTEGER | Foreign key to campaigns             |
+| cohort_period | TEXT    | Period identifier (e.g., '2024-W01') |
+| cohort_size   | INTEGER | Number of users in cohort            |
+| granularity   | TEXT    | 'day', 'week', 'month'               |
+| period_start  | TEXT    | ISO 8601 timestamp (period start)    |
+| period_end    | TEXT    | ISO 8601 timestamp (period end)      |
+| computed_at   | TEXT    | When this was computed               |
 
 **Unique constraint:** `(campaign_id, cohort_period, granularity)`
 
 ### retention_data
 
-| Column        | Type    | Description                                |
-| ------------- | ------- | ------------------------------------------ |
-| id            | INTEGER | Primary key                                |
-| campaign_id   | INTEGER | Foreign key to campaigns                   |
-| cohort_period | TEXT    | Period identifier                          |
-| offset_period | INTEGER | Offset from cohort (0, 1, 2, ...)         |
-| metric_type   | TEXT    | 'claimed', 'active'                        |
-| user_count    | INTEGER | Number of users who performed activity     |
-| granularity   | TEXT    | 'day', 'week', 'month'                     |
-| computed_at   | TEXT    | When this was computed                     |
+| Column        | Type    | Description                            |
+| ------------- | ------- | -------------------------------------- |
+| id            | INTEGER | Primary key                            |
+| campaign_id   | INTEGER | Foreign key to campaigns               |
+| cohort_period | TEXT    | Period identifier                      |
+| offset_period | INTEGER | Offset from cohort (0, 1, 2, ...)      |
+| metric_type   | TEXT    | 'claimed', 'active'                    |
+| user_count    | INTEGER | Number of users who performed activity |
+| granularity   | TEXT    | 'day', 'week', 'month'                 |
+| computed_at   | TEXT    | When this was computed                 |
 
 **Unique constraint:** `(campaign_id, cohort_period, offset_period, metric_type, granularity)`
 
@@ -269,7 +274,8 @@ curl -X POST "http://localhost:3001/api/v1/campaigns/1/activities" \
 
 ### With Event Indexer
 
-The cohort system can be integrated with the existing event indexer (`eventIndexer.js`) to automatically record user activities from on-chain events:
+The cohort system can be integrated with the existing event indexer (`eventIndexer.js`) to
+automatically record user activities from on-chain events:
 
 - `credit` events → record as "registered"
 - `claim` events → record as "claimed"
