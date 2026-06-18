@@ -113,6 +113,8 @@ Visual tests run automatically in CI via GitHub Actions. The workflow:
 3. Runs Playwright visual tests
 4. Uploads diff images if tests fail
 
+**Note:** Visual tests are currently non-blocking (continue-on-error: true) due to platform differences between local development (macOS/darwin) and CI (Linux). Linux-specific snapshots will be generated in a follow-up commit.
+
 ### Handling CI Failures
 
 If visual tests fail in CI:
