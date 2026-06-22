@@ -27,8 +27,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        contract: 
-          - ${{ github.event.inputs.contract == 'campaign' && 'campaign' || github.event.inputs.contract == 'rewards' && 'rewards' || 'campaign' }}
+        contract:
+          - ${{ github.event.inputs.contract == 'campaign' && 'campaign' ||
+            github.event.inputs.contract == 'rewards' && 'rewards' || 'campaign' }}
           - ${{ github.event.inputs.contract == 'all' && 'rewards' || '' }}
         exclude:
           - contract: ''
@@ -65,7 +66,7 @@ jobs:
         working-directory: contracts/${{ matrix.contract }}
         run: |
           echo "Running intensive fuzzing for ${{ matrix.contract }} contract for ${FUZZ_DURATION} seconds..."
-          
+
           # Run each fuzz test individually with timeout
           timeout ${FUZZ_DURATION}s cargo test --release fuzz_participant_count_matches_registered_set -- --nocapture || echo "Test completed/timed out"
           timeout ${FUZZ_DURATION}s cargo test --release fuzz_max_cap_enforcement -- --nocapture || echo "Test completed/timed out"  
@@ -76,7 +77,7 @@ jobs:
           timeout ${FUZZ_DURATION}s cargo test --release fuzz_deregister_consistency -- --nocapture || echo "Test completed/timed out"
           timeout ${FUZZ_DURATION}s cargo test --release fuzz_admin_rotation_integrity -- --nocapture || echo "Test completed/timed out"
           timeout ${FUZZ_DURATION}s cargo test --release fuzz_random_operation_sequence -- --nocapture || echo "Test completed/timed out"
-          
+
           echo "Fuzzing completed for ${{ matrix.contract }} contract"
 
       - name: Check for regression files

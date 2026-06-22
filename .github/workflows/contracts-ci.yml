@@ -40,7 +40,7 @@ jobs:
       - name: Run contract tests
         run: cargo test --workspace
 
-      # Run property-based fuzz tests using proptest 
+      # Run property-based fuzz tests using proptest
       - name: Run proptest fuzzing
         run: |
           echo "Running proptest-based fuzzing for campaign contract..."
@@ -121,7 +121,7 @@ jobs:
           timeout 30s cargo test --release -- fuzz_ --nocapture || echo "Campaign fuzzing completed/timed out"
           cd ../rewards  
           timeout 30s cargo test --release -- fuzz_ --nocapture || echo "Rewards fuzzing completed/timed out"
-          
+
       # Nightly fuzzing with seed corpus (future enhancement)
       - name: Generate fuzzing report
         if: github.event_name == 'pull_request'
