@@ -13,8 +13,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { requirePermission, ROLE_PERMISSIONS, ROLES } from './rbac.js';
 
+/** @param {{ orgRole?: string }} [opts] */
 function makeReqRes({ orgRole } = {}) {
-  const req = { auth: orgRole !== undefined ? { orgRole } : {} };
+  const req = /** @type {{ auth?: { orgRole?: string } }} */ ({ auth: { orgRole } });
   const res = {
     statusCode: 200,
     body: null,

@@ -24,7 +24,7 @@ async function startTestServer(options = {}) {
   });
   const server = app.listen(0);
   await once(server, 'listening');
-  const { port } = server.address();
+  const { port } = /** @type {import('net').AddressInfo} */ (server.address());
   return { server, baseUrl: `http://127.0.0.1:${port}` };
 }
 
@@ -51,7 +51,7 @@ test('POST /api/v1/orgs creates an org with master key', async () => {
       body: JSON.stringify({ name: 'Acme Corp' }),
     });
     assert.equal(res.status, 201);
-    const body = await res.json();
+    const body = /** @type {any} */ (await res.json());
     assert.equal(body.name, 'Acme Corp');
     assert.equal(typeof body.id, 'string');
     assert.equal(typeof body.createdAt, 'string');
@@ -83,7 +83,7 @@ test('POST /api/v1/orgs returns 400 when name is missing', async () => {
       body: JSON.stringify({}),
     });
     assert.equal(res.status, 400);
-    const body = await res.json();
+    const body = /** @type {any} */ (await res.json());
     assert.equal(body.code, 'VALIDATION_ERROR');
   } finally {
     await stopTestServer(server);
@@ -101,14 +101,14 @@ test('env API keys are treated as owners and can read any org', async () => {
       headers: masterHeaders(),
       body: JSON.stringify({ name: 'Env-Key Org' }),
     });
-    const org = await createRes.json();
+    const org = /** @type {any} */ (await createRes.json());
 
     // Env-sourced API key should be able to read it (orgRole=owner).
     const getRes = await fetch(`${baseUrl}/api/v1/orgs/${org.id}`, {
       headers: orgMemberHeaders(API_KEY_A),
     });
     assert.equal(getRes.status, 200);
-    const body = await getRes.json();
+    const body = /** @type {any} */ (await getRes.json());
     assert.equal(body.id, org.id);
   } finally {
     await stopTestServer(server);
@@ -124,7 +124,7 @@ test('GET /api/v1/orgs/:id returns 404 for unknown org', async () => {
       headers: orgMemberHeaders(API_KEY_A),
     });
     assert.equal(res.status, 404);
-    const body = await res.json();
+    const body = /** @type {any} */ (await res.json());
     assert.equal(body.code, 'ORG_NOT_FOUND');
   } finally {
     await stopTestServer(server);
@@ -141,7 +141,7 @@ test('DELETE /api/v1/orgs/:id with owner role deletes the org', async () => {
       headers: masterHeaders(),
       body: JSON.stringify({ name: 'Delete Me' }),
     });
-    const org = await createRes.json();
+    const org = /** @type {any} */ (await createRes.json());
 
     const delRes = await fetch(`${baseUrl}/api/v1/orgs/${org.id}`, {
       method: 'DELETE',
