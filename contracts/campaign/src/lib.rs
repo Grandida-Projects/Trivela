@@ -231,7 +231,9 @@ impl CampaignContract {
             .instance()
             .set(&SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
         env.storage().instance().set(&ADMIN_NONCE, &0u64);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -259,7 +261,9 @@ impl CampaignContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(CURRENT_SCHEMA_VERSION)
     }
 
@@ -282,7 +286,9 @@ impl CampaignContract {
         env.storage().instance().set(&START_TIME, &start);
         env.storage().instance().set(&END_TIME, &end);
         env.events().publish((SET_WINDOW_EVENT,), (start, end));
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -314,7 +320,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&CAMPAIGN_ACTIVE, &active);
         env.events().publish((SET_ACTIVE_EVENT,), active);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -323,7 +331,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&MAX_CAP, &max_cap);
         env.events().publish((SET_MAX_CAP_EVENT,), max_cap);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -341,7 +351,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&MERKLE_ROOT, &root);
         env.events().publish((SET_MERKLE_ROOT_EVENT,), root.clone());
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -457,9 +469,11 @@ impl CampaignContract {
         // pattern used elsewhere in the workspace; the deployer can
         // tune via a future admin-only setter without changing the
         // storage tier.
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, PARTICIPANT_TTL_THRESHOLD, PARTICIPANT_TTL_EXTEND_TO);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PARTICIPANT_TTL_THRESHOLD,
+            PARTICIPANT_TTL_EXTEND_TO,
+        );
 
         let count: u64 = env
             .storage()
@@ -488,8 +502,7 @@ impl CampaignContract {
             );
 
             let count_key = (REFERRAL_COUNT, referrer.clone());
-            let referral_total: u64 =
-                env.storage().persistent().get(&count_key).unwrap_or(0);
+            let referral_total: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
             env.storage()
                 .persistent()
                 .set(&count_key, &(referral_total + 1));
@@ -507,7 +520,9 @@ impl CampaignContract {
         // (PARTICIPANT_COUNT, ADMIN, etc.) so keep its TTL fresh
         // too.
         env.storage().instance().extend_ttl(50, 100);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(true)
     }
 
@@ -525,7 +540,11 @@ impl CampaignContract {
                 return Err(Error::OutsideTimeWindow);
             }
         } else {
-            let active: bool = env.storage().instance().get(&CAMPAIGN_ACTIVE).unwrap_or(false);
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&CAMPAIGN_ACTIVE)
+                .unwrap_or(false);
             if !active {
                 return Err(Error::CampaignInactive);
             }
@@ -625,7 +644,9 @@ impl CampaignContract {
         env.storage().instance().set(&PENDING_ADMIN, &new_admin);
         env.events()
             .publish((ADMIN_PROPOSED_EVENT, current_admin), new_admin);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -644,9 +665,10 @@ impl CampaignContract {
         }
         env.storage().instance().set(&ADMIN, &new_admin);
         env.storage().instance().remove(&PENDING_ADMIN);
-        env.events()
-            .publish((ADMIN_ACCEPTED_EVENT,), new_admin);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.events().publish((ADMIN_ACCEPTED_EVENT,), new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -658,7 +680,9 @@ impl CampaignContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().remove(&PENDING_ADMIN);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -714,22 +738,35 @@ impl CampaignContract {
 fn do_deregister(env: &Env, participant: Address) -> bool {
     // #280 — Participant records live in PERSISTENT storage.
     let key = (PARTICIPANT, participant.clone());
-    if !env.storage().persistent().get::<_, bool>(&key).unwrap_or(false) {
+    if !env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false)
+    {
         return false;
     }
     env.storage().persistent().remove(&key);
-    let count: u64 = env.storage().instance().get(&PARTICIPANT_COUNT).unwrap_or(0);
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&PARTICIPANT_COUNT)
+        .unwrap_or(0);
     if count > 0 {
-        env.storage().instance().set(&PARTICIPANT_COUNT, &(count - 1));
+        env.storage()
+            .instance()
+            .set(&PARTICIPANT_COUNT, &(count - 1));
     }
-    env.events().publish(
-        (Symbol::new(env, "deregister"), participant),
-        (),
-    );
-    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.events()
+        .publish((Symbol::new(env, "deregister"), participant), ());
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     true
 }
 
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod fuzz_test;
