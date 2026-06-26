@@ -67,6 +67,10 @@ import { requestTimeout } from './middleware/timeout.js';
 import { PoolSaturatedError } from './rpcPool.js';
 import { initializeWebSocket, getWebSocketServer } from './websocket/index.js';
 import { requireScope } from './middleware/rbac.js';
+import { createDistributedLock, createInMemoryLock } from './jobs/distributedLock.js';
+import { createExportJob } from './jobs/exportJob.js';
+import { createSqliteJobQueueRepository } from './dal/sqliteJobQueueRepository.js';
+import { createDurableJobQueue } from './jobs/durableJobQueue.js';
 
 const DEFAULT_PORT = 3001;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
@@ -422,6 +426,33 @@ export async function createApp(options = {}) {
     }
   }
 
+  // Distributed lock — Redis when available, in-process Map otherwise (#564)
+  const lockTtlMs = normalizePositiveInteger(
+    /** @type {any} */ (options.lockTtlMs) ?? process.env.LOCK_TTL_MS,
+    30_000,
+  );
+  const lockProvider =
+    options.lockProvider ??
+    (usageRedisClient
+      ? createDistributedLock(usageRedisClient, { ttlMs: lockTtlMs })
+      : createInMemoryLock({ ttlMs: lockTtlMs }));
+
+  // Data export job — daily CSV export to object storage (#562)
+  const exportRetentionDays = normalizePositiveInteger(
+    /** @type {any} */ (options.exportRetentionDays) ?? process.env.EXPORT_RETENTION_DAYS,
+    30,
+  );
+  const exportJob = createExportJob({
+    db: dal.db,
+    storage: storageAdapter,
+    logger: log,
+    retentionDays: exportRetentionDays,
+    uploadDir: process.env.UPLOAD_DIR ?? './uploads',
+  });
+
+  // Durable job queue store — persistent across restarts (#565)
+  const jobQueueStore = createSqliteJobQueueRepository({ db: dal.db });
+
   const usageMeteringService = createUsageMeteringService({
     usageRepository,
     redisClient: usageRedisClient ?? /** @type {any} */ (options.usageRedisClient) ?? null,
@@ -549,9 +580,13 @@ export async function createApp(options = {}) {
       async webhook_retry_failed_deliveries() {
         await webhookService.retryFailedDeliveries();
       },
+      async data_export({ date }) {
+        await exportJob.run(date);
+      },
     },
     logger: log,
     deadLetter: failedJobRepository,
+    lockProvider,
     defaultMaxAttempts: jobMaxAttempts,
     defaultBaseDelayMs: jobBaseDelayMs,
     defaultMaxDelayMs: jobMaxDelayMs,
@@ -570,6 +605,25 @@ export async function createApp(options = {}) {
       () => jobRunner.enqueue('webhook_retry_failed_deliveries', null),
       webhookRetryIntervalMs,
     ).unref?.();
+  }
+
+  // Daily data export — idempotent, safe to fire on every startup (#562)
+  if (!options.disableJobs) {
+    const doExport = () =>
+      jobRunner.enqueue('data_export', { date: new Date().toISOString().slice(0, 10) });
+    doExport();
+    setInterval(doExport, 24 * 60 * 60 * 1_000).unref?.();
+  }
+
+  // Durable job queue — starts poll loop and recovers stale jobs from prior crashes (#565)
+  const durableJobQueue = createDurableJobQueue({
+    store: jobQueueStore,
+    handlers: {},
+    logger: log,
+    deadLetter: failedJobRepository,
+  });
+  if (!options.disableJobs) {
+    durableJobQueue.start();
   }
 
   async function buildHealthPayload() {
@@ -1730,6 +1784,26 @@ export async function createApp(options = {}) {
     // Job dead-letter inspection / requeue (Issue #286)
     app.get(`${prefix}/jobs/failed`, rateLimiter, ...guard, listFailedJobsHandler);
     app.post(`${prefix}/jobs/retry/:id`, rateLimiter, ...guard, retryFailedJobHandler);
+
+    // Durable job queue DLQ admin — inspect and replay dead jobs (#565)
+    app.get(`${prefix}/admin/jobs/dlq`, rateLimiter, requireMasterKey, (req, res) => {
+      const limit = Math.min(parseInt(/** @type {any} */ (req.query.limit)) || 100, 500);
+      const offset = Math.max(parseInt(/** @type {any} */ (req.query.offset)) || 0, 0);
+      const items = jobQueueStore.listDead({ limit, offset });
+      const total = jobQueueStore.countDead();
+      return res.json({ data: items, pagination: { total, count: items.length, limit, offset } });
+    });
+
+    app.post(`${prefix}/admin/jobs/:id/replay`, rateLimiter, requireMasterKey, async (req, res) => {
+      const job = jobQueueStore.getById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+      }
+      durableJobQueue.enqueue(job.type, job.payload);
+      jobQueueStore.removeById(job.id);
+      recordAuditEntry(req, { action: 'replay', entity: 'durableJob', entityId: job.id });
+      return res.status(202).json({ requeued: true, job: { id: job.id, type: job.type } });
+    });
 
     // Webhook routes (Issue #287)
     app.post(`${prefix}/webhooks`, rateLimiter, ...guard, (req, res) => {
