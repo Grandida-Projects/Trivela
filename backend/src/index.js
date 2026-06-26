@@ -3,35 +3,85 @@
  * Serves campaign data, health, and Stellar/Soroban RPC proxy for the frontend.
  */
 
+// #288 — OpenTelemetry SDK MUST initialize before any `http` /
+// `express` import so the auto-instrumentation patches catch them.
+// `initTracing()` is fire-and-forget; the API/SDK still works as a
+// no-op when the optional OTel deps aren't installed.
+import { initTracing, traceparentMiddleware, shutdownTracing } from './tracing.js';
+void initTracing();
+
 import cors from 'cors';
 import express from 'express';
+import compression from 'compression';
+import multer from 'multer';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import Redis from 'ioredis';
-import createApiKeyAuth from './middleware/apiKeyAuth.js';
+import createApiKeyAuth, { createMasterKeyAuth } from './middleware/apiKeyAuth.js';
 import { createRateLimiter, createRedisStore } from './middleware/rateLimit.js';
+import { createAuthLockout } from './middleware/authLockout.js';
 import requestLogger, { log } from './middleware/logger.js';
 import requestId from './middleware/requestId.js';
 import securityHeaders from './middleware/securityHeaders.js';
 import errorHandler from './middleware/errorHandler.js';
 import { paginateItems } from './pagination.js';
 import { checkSorobanRpcHealth } from './sorobanRpc.js';
+import { createRpcPool } from './rpcPool.js';
 import { resolveStellarNetworkConfig } from './config/stellarNetwork.js';
 import { validateBackendEnv } from './config/envValidation.js';
 import { createDal } from './dal/index.js';
 import { createJobRunner } from './jobs/jobRunner.js';
+import { WebhookService, WEBHOOK_EVENTS } from './services/webhookService.js';
 import {
   campaignCreateSchema,
   campaignUpdateSchema,
   cursorBodySchema,
+  apiKeyCreateSchema,
   formatZodErrors,
 } from './schemas.js';
+import { createStorageAdapter } from './storage/index.js';
+import {
+  uploadCampaignImage,
+  validateImageUpload,
+  MAX_IMAGE_SIZE_BYTES,
+} from './services/imageUpload.js';
+import { buildCampaignStats } from './services/campaignStatsService.js';
+import { generateAllowlist } from './lib/allowlist/merkle.js';
+import { parseAllowlistCsv, validateGAddress, MAX_ALLOWLIST_ROWS } from './lib/allowlist/csv.js';
+import { createEmbedRoute } from './routes/embed.js';
+import { createVariantRoutes } from './routes/variants.js';
+import { createVariantService } from './services/variantService.js';
+import { createCohortRoutes } from './routes/cohorts.js';
+import { createCohortService } from './services/cohortService.js';
+import { createPushRoutes } from './routes/push.js';
+import { createOrgRoutes } from './routes/orgs.js';
+import { createAuditRouter } from './routes/audit.js';
+import { createAuditLogService } from './services/auditLogService.js';
+import { createWebPushService } from './services/webPushService.js';
+import { createOrganizationRoutes } from './routes/organizations.js';
+import { createUsageMeteringService } from './services/usageMeteringService.js';
+import { createFeatureFlagRoutes } from './routes/featureFlags.js';
+import { createFeatureFlagService } from './services/featureFlagService.js';
+import { createUsageMeteringMiddleware } from './middleware/usageMetering.js';
+import { requestTimeout } from './middleware/timeout.js';
+import { PoolSaturatedError } from './rpcPool.js';
+import { initializeWebSocket, getWebSocketServer } from './websocket/index.js';
+import { requireScope } from './middleware/rbac.js';
+import { createDistributedLock, createInMemoryLock } from './jobs/distributedLock.js';
+import { createExportJob } from './jobs/exportJob.js';
+import { createSqliteJobQueueRepository } from './dal/sqliteJobQueueRepository.js';
+import { createDurableJobQueue } from './jobs/durableJobQueue.js';
 
 const DEFAULT_PORT = 3001;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_RATE_LIMIT_MAX_REQUESTS = 60;
+const DEFAULT_AUTH_LOCKOUT_SOFT_THRESHOLD = 5;
+const DEFAULT_AUTH_LOCKOUT_HARD_THRESHOLD = 10;
+const DEFAULT_AUTH_LOCKOUT_BASE_LOCKOUT_MS = 60_000;
 const DEFAULT_SHORT_CACHE_TTL_MS = 5_000;
 const DEFAULT_JSON_BODY_LIMIT = '100kb';
 const DEFAULT_RPC_POLL_INTERVAL_MS = 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const LEGACY_API_PREFIX = '/api';
 const API_V1_PREFIX = '/api/v1';
 const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
@@ -77,7 +127,11 @@ function createCorsOptions(allowedOrigins) {
     maxAge: 86400,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'X-API-Key'],
+    // #288 — accept `traceparent` from instrumented frontends and
+    // expose it on responses so the browser can stitch its own
+    // spans into the same OpenTelemetry trace.
+    allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'traceparent'],
+    exposedHeaders: ['traceparent'],
   };
 
   if (allowedOrigins.includes('*')) {
@@ -85,7 +139,10 @@ function createCorsOptions(allowedOrigins) {
   }
 
   return {
-    origin(/** @type {string | undefined} */ origin, /** @type {(err: Error | null, allow?: boolean) => void} */ callback) {
+    origin(
+      /** @type {string | undefined} */ origin,
+      /** @type {(err: Error | null, allow?: boolean) => void} */ callback,
+    ) {
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
         return;
@@ -124,7 +181,9 @@ function validateContractId(value, label) {
 export async function createApp(options = {}) {
   const isProduction = process.env.NODE_ENV === 'production';
   const jsonBodyLimit =
-    /** @type {string} */ (options.jsonBodyLimit) ?? process.env.JSON_BODY_LIMIT ?? DEFAULT_JSON_BODY_LIMIT;
+    /** @type {string} */ (options.jsonBodyLimit) ??
+    process.env.JSON_BODY_LIMIT ??
+    DEFAULT_JSON_BODY_LIMIT;
   const corsAllowedOriginsRaw =
     /** @type {string | undefined} */ (options.corsAllowedOrigins) ??
     process.env.CORS_ALLOWED_ORIGINS ??
@@ -134,7 +193,8 @@ export async function createApp(options = {}) {
     network: /** @type {string} */ (options.stellarNetwork) ?? process.env.STELLAR_NETWORK,
     sorobanRpcUrl: /** @type {string} */ (options.sorobanRpcUrl) ?? process.env.SOROBAN_RPC_URL,
     horizonUrl: /** @type {string} */ (options.horizonUrl) ?? process.env.HORIZON_URL,
-    networkPassphrase: /** @type {string} */ (options.networkPassphrase) ?? process.env.STELLAR_NETWORK_PASSPHRASE,
+    networkPassphrase:
+      /** @type {string} */ (options.networkPassphrase) ?? process.env.STELLAR_NETWORK_PASSPHRASE,
   });
   const rewardsContractId = validateContractId(
     readOptionalConfigValue(options, 'REWARDS_CONTRACT_ID'),
@@ -145,12 +205,19 @@ export async function createApp(options = {}) {
     'CAMPAIGN_CONTRACT_ID',
   );
   const fetchImpl = /** @type {typeof fetch} */ (options.fetchImpl) ?? globalThis.fetch;
+  const rpcUrlsRaw =
+    /** @type {string | undefined} */ (options.sorobanRpcUrls) ?? process.env.SOROBAN_RPC_URLS;
+  const rpcUrls = rpcUrlsRaw
+    ? String(rpcUrlsRaw)
+        .split(',')
+        .map((u) => u.trim())
+        .filter(Boolean)
+    : [stellarConfig.sorobanRpcUrl];
+  const rpcPool = createRpcPool(rpcUrls);
   const allowedOrigins = parseAllowedOrigins(corsAllowedOriginsRaw);
 
   if (isProduction && allowedOrigins.includes('*')) {
-    throw new Error(
-      'Wildcard origins are not permitted in production.',
-    );
+    throw new Error('Wildcard origins are not permitted in production.');
   }
 
   const rateLimitWindowMs = normalizePositiveInteger(
@@ -160,6 +227,20 @@ export async function createApp(options = {}) {
   const rateLimitMaxRequests = normalizePositiveInteger(
     /** @type {any} */ (options.rateLimit)?.maxRequests ?? process.env.RATE_LIMIT_MAX_REQUESTS,
     DEFAULT_RATE_LIMIT_MAX_REQUESTS,
+  );
+
+  const authLockoutOptions = /** @type {any} */ (options.authLockout) ?? {};
+  const authLockoutSoftThreshold = normalizePositiveInteger(
+    authLockoutOptions.softThreshold ?? process.env.AUTH_LOCKOUT_SOFT_THRESHOLD,
+    DEFAULT_AUTH_LOCKOUT_SOFT_THRESHOLD,
+  );
+  const authLockoutHardThreshold = normalizePositiveInteger(
+    authLockoutOptions.hardThreshold ?? process.env.AUTH_LOCKOUT_HARD_THRESHOLD,
+    DEFAULT_AUTH_LOCKOUT_HARD_THRESHOLD,
+  );
+  const authLockoutBaseMs = normalizePositiveInteger(
+    authLockoutOptions.baseLockoutMs ?? process.env.AUTH_LOCKOUT_BASE_MS,
+    DEFAULT_AUTH_LOCKOUT_BASE_LOCKOUT_MS,
   );
 
   const seed = /** @type {any[]} */ (options.campaigns) ?? defaultSeed();
@@ -172,6 +253,43 @@ export async function createApp(options = {}) {
   });
   const campaignRepository = dal.campaigns;
   const auditLogRepository = dal.auditLogs;
+  const webhookRepository = dal.webhooks;
+  const referralRepository = dal.referrals;
+  const variantRepository = dal.variants;
+  const cohortRepository = dal.cohorts;
+  const pushSubscriptionRepository = dal.pushSubscriptions;
+  const apiKeyRepository = dal.apiKeys;
+  const failedJobRepository = options.failedJobRepository ?? dal.failedJobs;
+  const allowlistRepository = dal.allowlists;
+  const orgMemberRepository = dal.orgMembers;
+  const usageRepository = options.usageRepository ?? dal.usage;
+
+  const storageAdapter = /** @type {import('./storage/storageAdapter.js').StorageAdapter} */ (
+    options.storageAdapter ?? createStorageAdapter(process.env)
+  );
+  const imageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_IMAGE_SIZE_BYTES },
+  });
+  const webhookService = new WebhookService(webhookRepository, {
+    fetchImpl,
+    logger: log,
+  });
+  const variantService = createVariantService({ variantRepo: variantRepository });
+  const cohortService = createCohortService({ cohortRepo: cohortRepository });
+  const auditLogService = createAuditLogService({
+    auditLogRepository,
+    orgMemberRepository,
+  });
+  const webPushService = createWebPushService({
+    repository: pushSubscriptionRepository,
+    vapid: {
+      publicKey: process.env.VAPID_PUBLIC_KEY,
+      privateKey: process.env.VAPID_PRIVATE_KEY,
+      subject: process.env.VAPID_SUBJECT,
+    },
+    logger: log,
+  });
   const shortCacheTtlMs = normalizePositiveInteger(
     /** @type {any} */ (options.shortCacheTtlMs) ?? process.env.SHORT_CACHE_TTL_MS,
     DEFAULT_SHORT_CACHE_TTL_MS,
@@ -182,7 +300,10 @@ export async function createApp(options = {}) {
   );
   const shortCache = new Map();
   const indexerCursorState = {
-    cursor: /** @type {string | null} */ (options.initialIndexerCursor) ?? process.env.INDEXER_EVENT_CURSOR ?? null,
+    cursor:
+      /** @type {string | null} */ (options.initialIndexerCursor) ??
+      process.env.INDEXER_EVENT_CURSOR ??
+      null,
     updatedAt: new Date().toISOString(),
     source: (options.initialIndexerCursor ?? process.env.INDEXER_EVENT_CURSOR) ? 'env' : 'runtime',
   };
@@ -196,13 +317,90 @@ export async function createApp(options = {}) {
     requestTotal: 0,
     requestErrors: 0,
     routeHits: new Map(),
+    authFailures: 0,
+    authLockouts: 0,
+    // p95 latency histogram — 12 buckets (ms): 50,100,200,500,1000,2000,5000,...
+    latencyBuckets: [50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 30_000, Infinity],
+    latencyCounts: /** @type {number[]} */ ([]),
+    latencyTotal: 0,
+    latencySum: 0,
   };
+  // Initialise bucket counters to 0.
+  metrics.latencyCounts = metrics.latencyBuckets.map(() => 0);
 
-  const requireApiKey = createApiKeyAuth({
-    apiKeys: /** @type {string} */ (options.apiKeys) ?? /** @type {string} */ (options.apiKey) ?? process.env.TRIVELA_API_KEYS ?? process.env.TRIVELA_API_KEY ?? '',
+  // Apply global request deadline so every route self-defends against slow
+  // upstreams.  The timeout is configurable via REQUEST_TIMEOUT_MS.
+  const requestTimeoutMs = normalizePositiveInteger(
+    options.requestTimeoutMs ?? process.env.REQUEST_TIMEOUT_MS,
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  );
+  app.use(requestTimeout(requestTimeoutMs));
+
+  /**
+   * Compatibility shim: ?api_version=v0 rewrites v1 routes to legacy patterns
+   * and adds a Deprecation header. This is a temporary bridge for integrators
+   * during the 90-day migration window (see docs/API_MIGRATION.md).
+   */
+  app.use((req, res, next) => {
+    if (req.query.api_version === 'v0') {
+      // Rewrite /api/v1/* → /api/* for route matching
+      req.url = req.url.replace(/^\/api\/v1/, '/api');
+      res.setHeader('Deprecation', 'true');
+      res.setHeader('Sunset', 'Sat, 01 Jul 2026 00:00:00 GMT');
+    }
+    next();
   });
 
+  // Brute-force / credential-stuffing guard (#588). Runs immediately before the
+  // auth middleware on every protected route; a spike in failures/lockouts is
+  // surfaced via the trivela_auth_* counters and structured warn logs.
+  const authGuard = createAuthLockout({
+    softThreshold: authLockoutSoftThreshold,
+    hardThreshold: authLockoutHardThreshold,
+    baseLockoutMs: authLockoutBaseMs,
+    timeProvider: authLockoutOptions.timeProvider,
+    delayFn: authLockoutOptions.delayFn,
+    store: authLockoutOptions.store,
+    onFailure: ({ key, failures }) => {
+      metrics.authFailures += 1;
+      log.warn({ key, failures }, 'Failed authentication attempt');
+    },
+    onLockout: ({ key, failures, lockoutMs, lockoutCount }) => {
+      metrics.authLockouts += 1;
+      log.warn(
+        { key, failures, lockoutMs, lockoutCount },
+        'Authentication lockout triggered (possible brute-force)',
+      );
+    },
+  });
+
+  // Auth middlewares are exposed as [authGuard, requireX] arrays; Express
+  // flattens nested handler arrays, so existing route registrations pick up the
+  // guard with no change. Only auth-bearing routes are guarded, which keeps a
+  // 200 on a public route from ever resetting an attacker's failure counter.
+  const requireApiKey = [
+    authGuard,
+    createApiKeyAuth({
+      apiKeys:
+        /** @type {string} */ (options.apiKeys) ??
+        /** @type {string} */ (options.apiKey) ??
+        process.env.TRIVELA_API_KEYS ??
+        process.env.TRIVELA_API_KEY ??
+        '',
+      apiKeyRepository: options.apiKeyRepository ?? apiKeyRepository,
+      orgMemberRepository: options.orgMemberRepository ?? orgMemberRepository,
+    }),
+  ];
+  const requireMasterKey = [
+    authGuard,
+    createMasterKeyAuth({
+      masterKey: /** @type {string} */ (options.masterKey) ?? process.env.TRIVELA_MASTER_KEY ?? '',
+    }),
+  ];
+  const requireAdminMasterKey = requireMasterKey;
+
   let rateLimitStore = null;
+  let usageRedisClient = null;
   const redisUrl = process.env.REDIS_URL || process.env.REDIS_HOST;
   if (redisUrl && !options.disableRedis) {
     try {
@@ -215,11 +413,54 @@ export async function createApp(options = {}) {
         log.error({ err }, 'Redis connection error');
       });
       rateLimitStore = createRedisStore(redisClient);
-      log.info({ redisUrl: redisUrl.replace(/:[^:@]+@/, ':***@') }, 'Rate limiter using Redis store');
+      usageRedisClient = redisClient;
+      log.info(
+        { redisUrl: redisUrl.replace(/:[^:@]+@/, ':***@') },
+        'Rate limiter using Redis store',
+      );
     } catch (error) {
-      log.warn({ err: error }, 'Failed to connect to Redis, falling back to in-memory rate limiter');
+      log.warn(
+        { err: error },
+        'Failed to connect to Redis, falling back to in-memory rate limiter',
+      );
     }
   }
+
+  // Distributed lock — Redis when available, in-process Map otherwise (#564)
+  const lockTtlMs = normalizePositiveInteger(
+    /** @type {any} */ (options.lockTtlMs) ?? process.env.LOCK_TTL_MS,
+    30_000,
+  );
+  const lockProvider =
+    options.lockProvider ??
+    (usageRedisClient
+      ? createDistributedLock(usageRedisClient, { ttlMs: lockTtlMs })
+      : createInMemoryLock({ ttlMs: lockTtlMs }));
+
+  // Data export job — daily CSV export to object storage (#562)
+  const exportRetentionDays = normalizePositiveInteger(
+    /** @type {any} */ (options.exportRetentionDays) ?? process.env.EXPORT_RETENTION_DAYS,
+    30,
+  );
+  const exportJob = createExportJob({
+    db: dal.db,
+    storage: storageAdapter,
+    logger: log,
+    retentionDays: exportRetentionDays,
+    uploadDir: process.env.UPLOAD_DIR ?? './uploads',
+  });
+
+  // Durable job queue store — persistent across restarts (#565)
+  const jobQueueStore = createSqliteJobQueueRepository({ db: dal.db });
+
+  const usageMeteringService = createUsageMeteringService({
+    usageRepository,
+    redisClient: usageRedisClient ?? /** @type {any} */ (options.usageRedisClient) ?? null,
+    timeProvider: /** @type {any} */ (options.usageMeteringService)?.timeProvider,
+  });
+  const stopUsageFlush = usageMeteringService.startFlushInterval();
+
+  const usageMeteringMiddleware = createUsageMeteringMiddleware({ usageMeteringService });
 
   const rateLimiter = createRateLimiter({
     windowMs: rateLimitWindowMs,
@@ -229,59 +470,126 @@ export async function createApp(options = {}) {
   });
 
   app.use(requestId);
+  app.use(compression({ threshold: 1024 }));
   app.use(cors(createCorsOptions(allowedOrigins)));
   app.use(securityHeaders);
+  app.use(traceparentMiddleware());
   app.use(requestLogger);
   app.use(express.json({ limit: jsonBodyLimit }));
-  app.use((/** @type {any} */ err, /** @type {import('express').Request} */ _req, /** @type {import('express').Response} */ res, /** @type {import('express').NextFunction} */ next) => {
-    if (err?.type === 'entity.too.large') {
-      return res.status(413).json({ error: 'Request body too large', code: 'PAYLOAD_TOO_LARGE' });
-    }
-    return next(err);
-  });
-  app.use((/** @type {import('express').Request} */ req, /** @type {import('express').Response} */ res, /** @type {import('express').NextFunction} */ next) => {
-    metrics.requestTotal += 1;
-    res.on('finish', () => {
-      const routeKey = `${req.method} ${req.path}`;
-      metrics.routeHits.set(routeKey, (metrics.routeHits.get(routeKey) ?? 0) + 1);
-      if (res.statusCode >= 400) {
-        metrics.requestErrors += 1;
+
+  const uploadDir = process.env.UPLOAD_DIR ?? './uploads';
+  if ((process.env.STORAGE_BACKEND ?? 'local') === 'local') {
+    app.use('/uploads', express.static(uploadDir));
+  }
+  app.use(
+    (
+      /** @type {any} */ err,
+      /** @type {import('express').Request} */ _req,
+      /** @type {import('express').Response} */ res,
+      /** @type {import('express').NextFunction} */ next,
+    ) => {
+      if (err?.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Request body too large', code: 'PAYLOAD_TOO_LARGE' });
       }
-    });
-    next();
-  });
+      return next(err);
+    },
+  );
+  app.use(
+    (
+      /** @type {import('express').Request} */ req,
+      /** @type {import('express').Response} */ res,
+      /** @type {import('express').NextFunction} */ next,
+    ) => {
+      metrics.requestTotal += 1;
+      const _reqStart = Date.now();
+      res.on('finish', () => {
+        const routeKey = `${req.method} ${req.path}`;
+        metrics.routeHits.set(routeKey, (metrics.routeHits.get(routeKey) ?? 0) + 1);
+        if (res.statusCode >= 400) {
+          metrics.requestErrors += 1;
+        }
+        // Record request duration into the latency histogram.
+        const durationMs = Date.now() - _reqStart;
+        metrics.latencySum += durationMs;
+        metrics.latencyTotal += 1;
+        for (let _bi = 0; _bi < metrics.latencyBuckets.length; _bi++) {
+          if (durationMs <= metrics.latencyBuckets[_bi]) {
+            metrics.latencyCounts[_bi] += 1;
+            break;
+          }
+        }
+      });
+      next();
+    },
+  );
 
   const SCHEMA_VERSION_HEADER = 'X-Trivela-Schema-Version';
   const SCHEMA_VERSION = '1';
 
-  app.use((/** @type {import('express').Request} */ req, /** @type {import('express').Response} */ res, /** @type {import('express').NextFunction} */ next) => {
-    res.setHeader(SCHEMA_VERSION_HEADER, SCHEMA_VERSION);
+  app.use(
+    (
+      /** @type {import('express').Request} */ req,
+      /** @type {import('express').Response} */ res,
+      /** @type {import('express').NextFunction} */ next,
+    ) => {
+      res.setHeader(SCHEMA_VERSION_HEADER, SCHEMA_VERSION);
 
-    const requestedVersion = req.get(SCHEMA_VERSION_HEADER);
-    if (requestedVersion && requestedVersion !== SCHEMA_VERSION) {
-      return res.status(400).json({
-        error: 'Unsupported API schema version',
-        code: 'UNSUPPORTED_SCHEMA_VERSION',
-        supported: SCHEMA_VERSION,
-        requested: requestedVersion,
-      });
-    }
+      const requestedVersion = req.get(SCHEMA_VERSION_HEADER);
+      if (requestedVersion && requestedVersion !== SCHEMA_VERSION) {
+        return res.status(400).json({
+          error: 'Unsupported API schema version',
+          code: 'UNSUPPORTED_SCHEMA_VERSION',
+          supported: SCHEMA_VERSION,
+          requested: requestedVersion,
+        });
+      }
 
-    return next();
-  });
+      return next();
+    },
+  );
+
+  const jobMaxAttempts = normalizePositiveInteger(
+    /** @type {any} */ (options.jobMaxAttempts) ?? process.env.JOB_MAX_RETRIES,
+    5,
+  );
+  const jobBaseDelayMs = normalizePositiveInteger(
+    /** @type {any} */ (options.jobBaseDelayMs) ?? process.env.JOB_BASE_DELAY_MS,
+    1_000,
+  );
+  const jobMaxDelayMs = normalizePositiveInteger(
+    /** @type {any} */ (options.jobMaxDelayMs) ?? process.env.JOB_MAX_DELAY_MS,
+    30_000,
+  );
 
   const jobRunner = createJobRunner({
     handlers: {
       async rpc_health_poll() {
-        const rpc = await checkSorobanRpcHealth({
-          rpcUrl: stellarConfig.sorobanRpcUrl,
-          fetchImpl,
-        });
+        for (const url of rpcPool.getUrls()) {
+          const result = await checkSorobanRpcHealth({ rpcUrl: url, fetchImpl });
+          if (/** @type {any} */ (result).status === 'ok') {
+            rpcPool.markHealthy(url);
+          } else {
+            rpcPool.markUnhealthy(url);
+          }
+        }
+        const rpcUrl = rpcPool.getHealthyRpcUrl();
+        const rpc = await checkSorobanRpcHealth({ rpcUrl, fetchImpl });
         rpcHealthCache.payload = rpc;
         rpcHealthCache.updatedAt = new Date().toISOString();
       },
+      async webhook_retry_failed_deliveries() {
+        await webhookService.retryFailedDeliveries();
+      },
+      async data_export({ date }) {
+        await exportJob.run(date);
+      },
     },
     logger: log,
+    deadLetter: failedJobRepository,
+    lockProvider,
+    defaultMaxAttempts: jobMaxAttempts,
+    defaultBaseDelayMs: jobBaseDelayMs,
+    defaultMaxDelayMs: jobMaxDelayMs,
   });
 
   if (!options.disableJobs && rpcPollIntervalMs > 0) {
@@ -289,19 +597,45 @@ export async function createApp(options = {}) {
     setInterval(() => jobRunner.enqueue('rpc_health_poll', null), rpcPollIntervalMs).unref?.();
   }
 
+  // Enqueue webhook retry job every 5 minutes (Issue #352)
+  if (!options.disableJobs) {
+    const webhookRetryIntervalMs = 5 * 60 * 1000; // 5 minutes
+    jobRunner.enqueue('webhook_retry_failed_deliveries', null);
+    setInterval(
+      () => jobRunner.enqueue('webhook_retry_failed_deliveries', null),
+      webhookRetryIntervalMs,
+    ).unref?.();
+  }
+
+  // Daily data export — idempotent, safe to fire on every startup (#562)
+  if (!options.disableJobs) {
+    const doExport = () =>
+      jobRunner.enqueue('data_export', { date: new Date().toISOString().slice(0, 10) });
+    doExport();
+    setInterval(doExport, 24 * 60 * 60 * 1_000).unref?.();
+  }
+
+  // Durable job queue — starts poll loop and recovers stale jobs from prior crashes (#565)
+  const durableJobQueue = createDurableJobQueue({
+    store: jobQueueStore,
+    handlers: {},
+    logger: log,
+    deadLetter: failedJobRepository,
+  });
+  if (!options.disableJobs) {
+    durableJobQueue.start();
+  }
+
   async function buildHealthPayload() {
-    const rpc =
-      rpcHealthCache.payload ??
-      (await checkSorobanRpcHealth({
-        rpcUrl: stellarConfig.sorobanRpcUrl,
-        fetchImpl,
-      }));
+    const rpcUrl = rpcPool.getHealthyRpcUrl();
+    const rpc = rpcHealthCache.payload ?? (await checkSorobanRpcHealth({ rpcUrl, fetchImpl }));
 
     return {
       status: /** @type {any} */ (rpc).status === 'ok' ? 'ok' : 'degraded',
       service: 'trivela-api',
       timestamp: new Date().toISOString(),
       rpc,
+      rpcPool: rpcPool.getStatus(),
     };
   }
 
@@ -326,6 +660,7 @@ export async function createApp(options = {}) {
         entity,
         entityId,
         diff,
+        orgId: req.auth?.orgId || null,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -338,12 +673,36 @@ export async function createApp(options = {}) {
     res.json(payload);
   });
 
+  const siteOrigin =
+    process.env.SITE_ORIGIN ?? allowedOrigins.find((origin) => origin !== '*') ?? '';
+
+  // Embed endpoints use a tighter per-IP rate limit (30 req/min) to guard
+  // against scraping while still allowing reasonable widget traffic.
+  const embedRateLimiter = createRateLimiter({
+    windowMs: rateLimitWindowMs,
+    maxRequests: Math.min(30, rateLimitMaxRequests),
+    timeProvider: /** @type {any} */ (options.rateLimit)?.timeProvider,
+    store: rateLimitStore,
+  });
+
+  app.get(
+    '/embed/campaign/:id',
+    embedRateLimiter,
+    createEmbedRoute(campaignRepository, siteOrigin, {
+      embedSecret: process.env.EMBED_ATTRIBUTION_SECRET,
+    }),
+  );
+
   app.get('/health/rpc', async (_req, res) => {
-    const rpc = await checkSorobanRpcHealth({
-      rpcUrl: stellarConfig.sorobanRpcUrl,
-      fetchImpl,
+    const rpcUrl = rpcPool.getHealthyRpcUrl();
+    const rpc = await checkSorobanRpcHealth({ rpcUrl, fetchImpl });
+    if (/** @type {any} */ (rpc).status !== 'ok') {
+      rpcPool.markUnhealthy(rpcUrl);
+    }
+    res.status(/** @type {any} */ (rpc).status === 'ok' ? 200 : 503).json({
+      ...rpc,
+      rpcPool: rpcPool.getStatus(),
     });
-    res.status(/** @type {any} */ (rpc).status === 'ok' ? 200 : 503).json(rpc);
   });
 
   app.get('/metrics', (_req, res) => {
@@ -355,6 +714,18 @@ export async function createApp(options = {}) {
       })
       .join('\n');
 
+    // Latency histogram — cumulative buckets (le = upper bound in ms).
+    const latencyBucketLines = metrics.latencyBuckets
+      .map((le, i) => {
+        const cumulative = metrics.latencyCounts.slice(0, i + 1).reduce((a, b) => a + b, 0);
+        const leLabel = le === Infinity ? '+Inf' : String(le);
+        return `trivela_http_request_duration_ms_bucket{le="${leLabel}"} ${cumulative}`;
+      })
+      .join('\n');
+
+    // RPC pool saturation metrics.
+    const poolStatus = rpcPool.getStatus();
+
     const payload = [
       '# HELP trivela_requests_total Total HTTP requests handled.',
       '# TYPE trivela_requests_total counter',
@@ -362,12 +733,40 @@ export async function createApp(options = {}) {
       '# HELP trivela_request_errors_total Total HTTP requests with status >= 400.',
       '# TYPE trivela_request_errors_total counter',
       `trivela_request_errors_total ${metrics.requestErrors}`,
+      '# HELP trivela_auth_failures_total Total failed authentication attempts on guarded routes.',
+      '# TYPE trivela_auth_failures_total counter',
+      `trivela_auth_failures_total ${metrics.authFailures}`,
+      '# HELP trivela_auth_lockouts_total Total brute-force lockouts triggered on guarded routes.',
+      '# TYPE trivela_auth_lockouts_total counter',
+      `trivela_auth_lockouts_total ${metrics.authLockouts}`,
       '# HELP trivela_process_uptime_seconds Node.js process uptime.',
       '# TYPE trivela_process_uptime_seconds gauge',
       `trivela_process_uptime_seconds ${uptimeSeconds.toFixed(3)}`,
       '# HELP trivela_route_hits_total Route-level request counts.',
       '# TYPE trivela_route_hits_total counter',
       routeLines,
+      // Request latency histogram (issue #650 — p95 latency SLO).
+      '# HELP trivela_http_request_duration_ms HTTP request duration in milliseconds.',
+      '# TYPE trivela_http_request_duration_ms histogram',
+      latencyBucketLines,
+      `trivela_http_request_duration_ms_count ${metrics.latencyTotal}`,
+      `trivela_http_request_duration_ms_sum ${metrics.latencySum}`,
+      // RPC pool saturation (issue #650 — pool saturation safety).
+      '# HELP trivela_rpc_pool_in_use RPC pool slots currently in use.',
+      '# TYPE trivela_rpc_pool_in_use gauge',
+      `trivela_rpc_pool_in_use ${poolStatus.in_use}`,
+      '# HELP trivela_rpc_pool_idle RPC pool slots immediately available.',
+      '# TYPE trivela_rpc_pool_idle gauge',
+      `trivela_rpc_pool_idle ${poolStatus.idle}`,
+      '# HELP trivela_rpc_pool_waiting Callers queued waiting for a pool slot.',
+      '# TYPE trivela_rpc_pool_waiting gauge',
+      `trivela_rpc_pool_waiting ${poolStatus.waiting}`,
+      '# HELP trivela_rpc_pool_healthy Healthy RPC endpoints in the pool.',
+      '# TYPE trivela_rpc_pool_healthy gauge',
+      `trivela_rpc_pool_healthy ${poolStatus.healthy}`,
+      '# HELP trivela_rpc_pool_unhealthy Unhealthy RPC endpoints in the pool.',
+      '# TYPE trivela_rpc_pool_unhealthy gauge',
+      `trivela_rpc_pool_unhealthy ${poolStatus.unhealthy}`,
     ]
       .filter(Boolean)
       .join('\n');
@@ -394,16 +793,21 @@ export async function createApp(options = {}) {
         campaignById: `GET ${API_V1_PREFIX}/campaigns/:id`,
         campaignBySlug: `GET ${API_V1_PREFIX}/campaigns/by-slug/:slug`,
         createCampaign: `POST ${API_V1_PREFIX}/campaigns`,
+        cloneCampaign: `POST ${API_V1_PREFIX}/campaigns/:id/clone`,
         updateCampaign: `PUT ${API_V1_PREFIX}/campaigns/:id`,
         deleteCampaign: `DELETE ${API_V1_PREFIX}/campaigns/:id`,
         auditLogs: `GET ${API_V1_PREFIX}/audit-logs`,
+        usage: `GET ${API_V1_PREFIX}/usage`,
+        adminUsage: `GET ${API_V1_PREFIX}/admin/usage`,
+        adminUsageQuotas: `PUT ${API_V1_PREFIX}/admin/usage/quotas`,
         config: `GET ${API_V1_PREFIX}/config`,
         explorer: `GET ${API_V1_PREFIX}/explorer`,
       },
       compatibility: {
         legacyPrefix: LEGACY_API_PREFIX,
         legacyRoutesSupported: true,
-        migrationNote: 'Prefer /api/v1/* routes. Legacy /api/* routes remain available for compatibility.',
+        migrationNote:
+          'Prefer /api/v1/* routes. Legacy /api/* routes remain available for compatibility.',
         usingLegacyPrefix,
       },
       stellar: {
@@ -420,6 +824,12 @@ export async function createApp(options = {}) {
         keying: 'per API key when present, otherwise per IP address',
         windowMs: rateLimitWindowMs,
         maxRequests: rateLimitMaxRequests,
+      },
+      authLockout: {
+        keying: 'per client IP address',
+        softThreshold: authLockoutSoftThreshold,
+        hardThreshold: authLockoutHardThreshold,
+        baseLockoutMs: authLockoutBaseMs,
       },
       body: {
         jsonLimit: jsonBodyLimit,
@@ -458,17 +868,80 @@ export async function createApp(options = {}) {
 
     const activeRaw =
       typeof req.query.active === 'string' ? req.query.active.toLowerCase() : undefined;
-    const activeFilter =
-      activeRaw === 'true' ? true : activeRaw === 'false' ? false : undefined;
+    const activeFilter = activeRaw === 'true' ? true : activeRaw === 'false' ? false : undefined;
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
-    const order = req.query.order === 'asc' ? 'asc' : req.query.order === 'desc' ? 'desc' : undefined;
-    const items = campaignRepository.list({ active: activeFilter, q, sort, order });
+    const order =
+      req.query.order === 'asc' ? 'asc' : req.query.order === 'desc' ? 'desc' : undefined;
+    const category = typeof req.query.category === 'string' ? req.query.category.trim() : undefined;
+    const tagsRaw = typeof req.query.tags === 'string' ? req.query.tags.trim() : '';
+    const tags = tagsRaw
+      ? tagsRaw
+          .split(',')
+          .map((t) => t.trim())
+          .filter(Boolean)
+      : undefined;
+
+    // Status filtering (Issue #457)
+    // By default, only show published campaigns to public API
+    // API key holders can request draft/archived/all statuses
+    const statusRaw = typeof req.query.status === 'string' ? req.query.status.trim() : undefined;
+    const hasApiKey = req.context?.apiKeyRecord !== undefined;
+    let status = statusRaw;
+
+    if (statusRaw && ['draft', 'archived', 'all'].includes(statusRaw) && !hasApiKey) {
+      // Require API key for non-published statuses
+      return res.status(401).json({
+        error: 'API key required to access draft, archived, or all campaigns',
+        code: 'UNAUTHORIZED',
+      });
+    }
+
+    // Default to published only for public API
+    if (!status && !hasApiKey) {
+      status = 'published';
+    }
+
+    const items = campaignRepository.list({
+      active: activeFilter,
+      q,
+      sort,
+      order,
+      category,
+      tags,
+      status,
+    });
     const payload = paginateItems(items, req.query);
     shortCache.set(cacheKey, {
       expiresAt: Date.now() + shortCacheTtlMs,
       payload,
     });
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    return res.set('x-cache', 'MISS').json(payload);
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function getTrendingCampaigns(req, res) {
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '6'), 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 && limitRaw <= 50 ? limitRaw : 6;
+
+    const cacheKey = `trending:${limit}`;
+    const cached = shortCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+      return res.set('x-cache', 'HIT').json(cached.payload);
+    }
+
+    const all = campaignRepository.list({
+      active: true,
+      sort: 'reward_per_action',
+      order: 'desc',
+    });
+    const data = all.slice(0, limit);
+    const payload = { data, total: data.length };
+
+    shortCache.set(cacheKey, { expiresAt: Date.now() + shortCacheTtlMs, payload });
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
     return res.set('x-cache', 'MISS').json(payload);
   }
 
@@ -479,6 +952,24 @@ export async function createApp(options = {}) {
       return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
     }
     return res.json(campaign);
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function getCampaignStats(req, res) {
+    const campaign = campaignRepository.getById(req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+    }
+
+    const stats = buildCampaignStats({
+      db: dal.db,
+      campaign,
+      referralRepository,
+      indexerCursor: indexerCursorState,
+      query: req.query,
+    });
+
+    return res.json(stats);
   }
 
   /** @param {import('express').Request} req @param {import('express').Response} res */
@@ -501,7 +992,24 @@ export async function createApp(options = {}) {
       });
     }
 
-    const { name, slug, description, rewardPerAction, startDate, endDate, featured, hidden, hiddenReason, active } = result.data;
+    const {
+      name,
+      slug,
+      description,
+      rewardPerAction,
+      referralBonusPoints,
+      startDate,
+      endDate,
+      featured,
+      hidden,
+      hiddenReason,
+      active,
+      contractId,
+      imageUrl,
+      tags,
+      category,
+      status,
+    } = result.data;
     try {
       const campaign = campaignRepository.create({
         name,
@@ -512,8 +1020,14 @@ export async function createApp(options = {}) {
         hidden: hidden ?? false,
         hiddenReason: hiddenReason ?? null,
         rewardPerAction: rewardPerAction ?? 0,
+        referralBonusPoints: referralBonusPoints ?? 0,
         startDate: startDate ?? null,
         endDate: endDate ?? null,
+        contractId: contractId ?? null,
+        imageUrl: imageUrl ?? null,
+        tags: tags ?? [],
+        category: category ?? null,
+        status: status ?? 'draft',
       });
       recordAuditEntry(req, {
         action: 'create',
@@ -522,9 +1036,40 @@ export async function createApp(options = {}) {
         diff: { after: campaign },
       });
 
+      // Dispatch webhook event (Issue #287)
+      webhookService
+        .dispatchEvent({
+          type: WEBHOOK_EVENTS.CAMPAIGN_CREATED,
+          campaignId: campaign.id,
+          data: campaign,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn({ err, campaignId: campaign.id }, 'Failed to dispatch campaign.created webhook');
+        });
+
+      // Notify WebSocket clients about new campaign (Issue #456)
+      const wsServer = getWebSocketServer();
+      if (wsServer) {
+        wsServer.broadcast('campaigns', {
+          type: 'campaign_created',
+          campaign,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       shortCache.clear();
       return res.status(201).json(campaign);
     } catch (error) {
+      if (
+        /** @type {any} */ (error).message?.includes('Tag') ||
+        /** @type {any} */ (error).message?.includes('Category')
+      ) {
+        return res.status(400).json({
+          error: /** @type {Error} */ (error).message,
+          code: 'VALIDATION_ERROR',
+        });
+      }
       if (/** @type {any} */ (error).message?.includes('UNIQUE constraint failed')) {
         return res.status(409).json({
           error: 'Slug already exists',
@@ -547,7 +1092,23 @@ export async function createApp(options = {}) {
       });
     }
 
-    const { name, description, active, rewardPerAction, startDate, endDate, featured, hidden, hiddenReason } = result.data;
+    const {
+      name,
+      description,
+      active,
+      rewardPerAction,
+      referralBonusPoints,
+      startDate,
+      endDate,
+      featured,
+      hidden,
+      hiddenReason,
+      contractId,
+      imageUrl,
+      tags,
+      category,
+      status,
+    } = result.data;
     /** @type {Record<string, unknown>} */
     const updateFields = {};
     if (name !== undefined) updateFields.name = name;
@@ -555,17 +1116,38 @@ export async function createApp(options = {}) {
     if (active !== undefined) updateFields.active = active;
     if (featured !== undefined) updateFields.featured = featured;
     if (rewardPerAction !== undefined) updateFields.rewardPerAction = rewardPerAction;
+    if (referralBonusPoints !== undefined) updateFields.referralBonusPoints = referralBonusPoints;
     if (startDate !== undefined) updateFields.startDate = startDate;
     if (endDate !== undefined) updateFields.endDate = endDate;
     if (hidden !== undefined) updateFields.hidden = hidden;
     if (hiddenReason !== undefined) updateFields.hiddenReason = hiddenReason;
+    if (contractId !== undefined) updateFields.contractId = contractId;
+    if (imageUrl !== undefined) updateFields.imageUrl = imageUrl;
+    if (tags !== undefined) updateFields.tags = tags;
+    if (category !== undefined) updateFields.category = category;
+    if (status !== undefined) updateFields.status = status;
 
     const before = campaignRepository.getById(req.params.id);
     if (!before) {
       return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
     }
 
-    const campaign = campaignRepository.update(req.params.id, updateFields);
+    let campaign;
+    try {
+      campaign = campaignRepository.update(req.params.id, updateFields);
+    } catch (error) {
+      if (
+        /** @type {any} */ (error).message?.includes('Tag') ||
+        /** @type {any} */ (error).message?.includes('Category')
+      ) {
+        return res.status(400).json({
+          error: /** @type {Error} */ (error).message,
+          code: 'VALIDATION_ERROR',
+        });
+      }
+      throw error;
+    }
+
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
     }
@@ -576,6 +1158,53 @@ export async function createApp(options = {}) {
       entityId: campaign.id,
       diff: { before, after: campaign, changes },
     });
+
+    // Dispatch webhook events (Issue #290, #352)
+    const wasActive = before.active;
+    const isNowActive = campaign.active;
+
+    if (active !== undefined && wasActive !== isNowActive) {
+      // Dispatch activation/deactivation event
+      const eventType = isNowActive
+        ? WEBHOOK_EVENTS.CAMPAIGN_ACTIVATED
+        : WEBHOOK_EVENTS.CAMPAIGN_DEACTIVATED;
+      webhookService
+        .dispatchEvent({
+          type: eventType,
+          campaignId: campaign.id,
+          data: campaign,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn(
+            { err, campaignId: campaign.id, eventType },
+            'Failed to dispatch campaign activation/deactivation webhook',
+          );
+        });
+    } else {
+      // Dispatch generic update event
+      webhookService
+        .dispatchEvent({
+          type: WEBHOOK_EVENTS.CAMPAIGN_UPDATED,
+          campaignId: campaign.id,
+          data: campaign,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn({ err, campaignId: campaign.id }, 'Failed to dispatch campaign.updated webhook');
+        });
+    }
+
+    // Notify WebSocket clients about campaign update (Issue #456)
+    const wsServer = getWebSocketServer();
+    if (wsServer) {
+      wsServer.notifyCampaignUpdate(campaign.id, {
+        campaign,
+        changes,
+        before,
+      });
+    }
+
     shortCache.clear();
     return res.json(campaign);
   }
@@ -593,8 +1222,147 @@ export async function createApp(options = {}) {
       entityId: req.params.id,
       diff: before ? { before } : null,
     });
+
+    // Dispatch webhook event (Issue #285)
+    if (before) {
+      webhookService
+        .dispatchEvent({
+          type: WEBHOOK_EVENTS.CAMPAIGN_DELETED,
+          campaignId: req.params.id,
+          data: before,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn(
+            { err, campaignId: req.params.id },
+            'Failed to dispatch campaign.deleted webhook',
+          );
+        });
+    }
+
     shortCache.clear();
     return res.status(204).end();
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function cloneCampaign(req, res) {
+    const sourceId = req.params.id;
+    const source = campaignRepository.getById(sourceId);
+
+    if (!source) {
+      return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+    }
+
+    const overrides = req.body?.overrides || {};
+
+    try {
+      const clonedCampaign = campaignRepository.clone(sourceId, overrides);
+
+      if (!clonedCampaign) {
+        return res.status(500).json({ error: 'Failed to clone campaign', code: 'CLONE_FAILED' });
+      }
+
+      recordAuditEntry(req, {
+        action: 'clone',
+        entity: 'campaign',
+        entityId: clonedCampaign.id,
+        diff: { cloned_from: sourceId, overrides },
+      });
+
+      shortCache.clear();
+      return res.status(201).json(clonedCampaign);
+    } catch (error) {
+      if (/** @type {any} */ (error).message?.includes('UNIQUE constraint failed')) {
+        return res.status(409).json({
+          error: 'Slug already exists',
+          code: 'SLUG_CONFLICT',
+          details: ['A campaign with this slug already exists'],
+        });
+      }
+      throw error;
+    }
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function publishCampaign(req, res) {
+    const before = campaignRepository.getById(req.params.id);
+    if (!before) {
+      return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+    }
+
+    try {
+      const campaign = campaignRepository.publish(req.params.id);
+      recordAuditEntry(req, {
+        action: 'publish',
+        entity: 'campaign',
+        entityId: campaign.id,
+        diff: { before, after: campaign },
+      });
+
+      // Dispatch webhook event (Issue #457)
+      webhookService
+        .dispatchEvent({
+          type: 'campaign.published',
+          campaignId: campaign.id,
+          data: campaign,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn(
+            { err, campaignId: campaign.id },
+            'Failed to dispatch campaign.published webhook',
+          );
+        });
+
+      shortCache.clear();
+      return res.json(campaign);
+    } catch (error) {
+      return res.status(400).json({
+        error: /** @type {Error} */ (error).message,
+        code: 'PUBLISH_FAILED',
+      });
+    }
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function archiveCampaign(req, res) {
+    const before = campaignRepository.getById(req.params.id);
+    if (!before) {
+      return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+    }
+
+    try {
+      const campaign = campaignRepository.archive(req.params.id);
+      recordAuditEntry(req, {
+        action: 'archive',
+        entity: 'campaign',
+        entityId: campaign.id,
+        diff: { before, after: campaign },
+      });
+
+      // Dispatch webhook event (Issue #457)
+      webhookService
+        .dispatchEvent({
+          type: 'campaign.archived',
+          campaignId: campaign.id,
+          data: campaign,
+          timestamp: new Date().toISOString(),
+        })
+        .catch((err) => {
+          log.warn(
+            { err, campaignId: campaign.id },
+            'Failed to dispatch campaign.archived webhook',
+          );
+        });
+
+      shortCache.clear();
+      return res.json(campaign);
+    } catch (error) {
+      return res.status(400).json({
+        error: /** @type {Error} */ (error).message,
+        code: 'ARCHIVE_FAILED',
+      });
+    }
   }
 
   /** @param {import('express').Request} req @param {import('express').Response} res */
@@ -608,6 +1376,12 @@ export async function createApp(options = {}) {
       action: action || undefined,
     });
     return res.json(paginateItems(items, req.query));
+  }
+
+  /** @param {import('express').Request} _req @param {import('express').Response} res */
+  function verifyAuditChain(_req, res) {
+    const result = auditLogRepository.verify();
+    return res.status(result.valid ? 200 : 409).json(result);
   }
 
   /** @param {import('express').Request} _req @param {import('express').Response} res */
@@ -639,24 +1413,705 @@ export async function createApp(options = {}) {
     });
   }
 
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function listCategories(_req, res) {
+    const categories = campaignRepository.listCategories?.() ?? [];
+    return res.json({ data: categories });
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function listTags(_req, res) {
+    const tags = campaignRepository.listTags?.() ?? [];
+    return res.json({ data: tags });
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  async function getAdminDashboard(req, res) {
+    const cacheKey = 'admin:dashboard';
+    const cached = shortCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.set('x-cache', 'HIT').json(cached.payload);
+    }
+
+    // Campaign stats
+    const allCampaigns = campaignRepository.list({ includeHidden: true });
+    const totalCampaigns = allCampaigns.length;
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const campaignsByStatus = {
+      draft: allCampaigns.filter((c) => !c.active && c.hidden).length,
+      published: allCampaigns.filter((c) => c.active && !c.hidden).length,
+      archived: allCampaigns.filter((c) => !c.active && !c.hidden).length,
+    };
+
+    const campaignsCreatedLast7Days = allCampaigns.filter(
+      (c) => new Date(c.createdAt) >= sevenDaysAgo,
+    ).length;
+    const campaignsCreatedLast30Days = allCampaigns.filter(
+      (c) => new Date(c.createdAt) >= thirtyDaysAgo,
+    ).length;
+
+    // Participants (unique wallets from referrals)
+    const allReferrals = referralRepository.listAll?.() ?? [];
+    const uniqueParticipants = new Set();
+    for (const referral of allReferrals) {
+      uniqueParticipants.add(referral.refereeAddress);
+      uniqueParticipants.add(referral.referrerAddress);
+    }
+    const totalParticipants = uniqueParticipants.size;
+
+    // Rewards stats (placeholder - would need indexer event DB integration)
+    const rewards = {
+      totalPointsCredited: 0,
+      totalClaimed: 0,
+      redemptionRate: 0,
+    };
+
+    // Activity: registrations per day (last 30 days)
+    const activity = [];
+    for (let i = 29; i >= 0; i--) {
+      const date = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+      const dateStr = date.toISOString().split('T')[0];
+      const dayReferrals = allReferrals.filter((r) => r.createdAt.startsWith(dateStr)).length;
+      activity.push({ date: dateStr, registrations: dayReferrals });
+    }
+
+    // Errors from metrics (last 24h would need time-series tracking, using current total)
+    const errors = {
+      last24h: metrics.requestErrors,
+    };
+
+    // RPC pool status
+    const rpc = rpcPool.getStatus();
+
+    const payload = {
+      campaigns: {
+        total: totalCampaigns,
+        byStatus: campaignsByStatus,
+        createdLast7Days: campaignsCreatedLast7Days,
+        createdLast30Days: campaignsCreatedLast30Days,
+      },
+      participants: {
+        total: totalParticipants,
+      },
+      rewards,
+      activity,
+      errors,
+      rpc,
+      timestamp: now.toISOString(),
+    };
+
+    shortCache.set(cacheKey, {
+      expiresAt: Date.now() + 60000, // 60 seconds
+      payload,
+    });
+
+    return res.set('x-cache', 'MISS').json(payload);
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function listAdminCampaigns(req, res) {
+    const allCampaigns = campaignRepository.list({ includeHidden: true });
+    return res.json(paginateItems(allCampaigns, req.query));
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  async function uploadCampaignImageHandler(req, res) {
+    const campaign = campaignRepository.getById(req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+    }
+
+    const file = /** @type {Express.Multer.File | undefined} */ (req.file);
+    const validation = validateImageUpload({
+      buffer: file?.buffer,
+      mimetype: file?.mimetype ?? '',
+      size: file?.size ?? 0,
+      originalname: file?.originalname,
+    });
+
+    if (!validation.ok) {
+      return res.status(400).json({
+        error: validation.error,
+        code: validation.code,
+      });
+    }
+
+    try {
+      const { imageUrl } = await uploadCampaignImage(storageAdapter, {
+        buffer: validation.buffer,
+        mimeType: validation.mimeType,
+        campaignId: campaign.id,
+      });
+
+      const updated = campaignRepository.update(campaign.id, { imageUrl });
+      recordAuditEntry(req, {
+        action: 'update',
+        entity: 'campaign',
+        entityId: campaign.id,
+        diff: { before: campaign, after: updated, changes: ['imageUrl'] },
+      });
+
+      shortCache.clear();
+      return res.status(200).json({ imageUrl });
+    } catch (error) {
+      log.error({ err: error, campaignId: campaign.id }, 'Failed to upload campaign image');
+      return res.status(500).json({
+        error: 'Failed to upload image',
+        code: 'UPLOAD_FAILED',
+      });
+    }
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function createApiKeyHandler(req, res) {
+    const result = apiKeyCreateSchema.safeParse(req.body ?? {});
+    if (!result.success) {
+      return res.status(400).json({
+        error: 'Invalid API key payload',
+        code: 'VALIDATION_ERROR',
+        details: formatZodErrors(result.error),
+      });
+    }
+
+    const created = apiKeyRepository.create({
+      label: result.data.label ?? '',
+      expiresAt: result.data.expiresAt ?? null,
+      orgId: result.data.orgId ?? null,
+      scopes: result.data.scopes ?? undefined,
+    });
+
+    recordAuditEntry(req, {
+      action: 'create',
+      entity: 'apiKey',
+      entityId: created.key.id,
+      diff: { after: created.key },
+    });
+
+    return res.status(201).json({
+      key: created.rawKey,
+      metadata: created.key,
+    });
+  }
+
+  /** @param {import('express').Request} _req @param {import('express').Response} res */
+  function listApiKeysHandler(_req, res) {
+    const keys = apiKeyRepository.list();
+    return res.json({ data: keys });
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function revokeApiKeyHandler(req, res) {
+    const before = apiKeyRepository.getById(req.params.id);
+    if (!before) {
+      return res.status(404).json({ error: 'API key not found', code: 'API_KEY_NOT_FOUND' });
+    }
+
+    apiKeyRepository.revoke(req.params.id);
+    recordAuditEntry(req, {
+      action: 'revoke',
+      entity: 'apiKey',
+      entityId: req.params.id,
+      diff: { before },
+    });
+
+    return res.status(204).end();
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function rotateApiKeyHandler(req, res) {
+    const rotated = apiKeyRepository.rotate(req.params.id);
+    if (!rotated) {
+      return res
+        .status(404)
+        .json({ error: 'API key not found or already revoked', code: 'API_KEY_NOT_FOUND' });
+    }
+
+    recordAuditEntry(req, {
+      action: 'rotate',
+      entity: 'apiKey',
+      entityId: req.params.id,
+      diff: { newKeyId: rotated.key.id },
+    });
+
+    return res.status(200).json({
+      key: rotated.rawKey,
+      metadata: rotated.key,
+    });
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function listFailedJobsHandler(req, res) {
+    const limitRaw = Number.parseInt(/** @type {string} */ (req.query.limit), 10);
+    const offsetRaw = Number.parseInt(/** @type {string} */ (req.query.offset), 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 100;
+    const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+    const items = failedJobRepository.list({ limit, offset });
+    const total = failedJobRepository.count();
+
+    return res.json({
+      data: items,
+      pagination: { total, count: items.length, limit, offset },
+    });
+  }
+
+  /** @param {import('express').Request} req @param {import('express').Response} res */
+  function retryFailedJobHandler(req, res) {
+    const entry = failedJobRepository.getById(req.params.id);
+    if (!entry) {
+      return res.status(404).json({ error: 'Failed job not found', code: 'FAILED_JOB_NOT_FOUND' });
+    }
+
+    jobRunner.enqueue(entry.type, entry.payload);
+    failedJobRepository.remove(entry.id);
+
+    recordAuditEntry(req, {
+      action: 'retry',
+      entity: 'failedJob',
+      entityId: entry.id,
+      diff: { type: entry.type, attempts: entry.attempts },
+    });
+
+    return res.status(202).json({
+      requeued: true,
+      job: { id: entry.id, type: entry.type },
+    });
+  }
+
   /** @param {string} prefix */
   function registerApiRoutes(prefix) {
+    // Shorthand: auth + per-tenant api_calls metering in one step.
+    const guard = [requireApiKey, usageMeteringMiddleware];
+
     app.get(prefix, rateLimiter, apiInfo);
     app.get(`${prefix}/config`, rateLimiter, getPublicConfig);
     app.get(`${prefix}/explorer`, rateLimiter, getExplorerLinks);
     app.get(`${prefix}/campaigns`, rateLimiter, listCampaigns);
+    app.get(`${prefix}/categories`, rateLimiter, listCategories);
+    app.get(`${prefix}/tags`, rateLimiter, listTags);
+    app.get(`${prefix}/campaigns/trending`, rateLimiter, getTrendingCampaigns);
     app.get(`${prefix}/campaigns/by-slug/:slug`, rateLimiter, getCampaignBySlug);
     app.get(`${prefix}/campaigns/:id`, rateLimiter, getCampaignById);
-    app.get(`${prefix}/audit-logs`, rateLimiter, requireApiKey, listAuditLogs);
+    app.get(`${prefix}/campaigns/:id/stats`, rateLimiter, getCampaignStats);
+    app.get(`${prefix}/audit-logs`, rateLimiter, ...guard, listAuditLogs);
+    app.get(`${prefix}/admin/audit/verify`, rateLimiter, requireMasterKey, verifyAuditChain);
     app.get(`${prefix}/indexer/cursor`, rateLimiter, getIndexerCursorState);
-    app.post(`${prefix}/indexer/cursor`, rateLimiter, requireApiKey, setIndexerCursorState);
-    app.post(`${prefix}/campaigns`, rateLimiter, requireApiKey, createCampaign);
+    app.post(`${prefix}/indexer/cursor`, rateLimiter, ...guard, setIndexerCursorState);
+    app.post(`${prefix}/campaigns`, rateLimiter, ...guard, requireScope('campaigns:write'), createCampaign);
+    app.post(`${prefix}/campaigns/:id/clone`, rateLimiter, ...guard, requireScope('campaigns:write'), cloneCampaign);
+    app.post(`${prefix}/campaigns/:id/image`, rateLimiter, ...guard, requireScope('campaigns:write'), (req, res, next) => {
+      imageUpload.single('image')(req, res, (err) => {
+        if (err?.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({
+            error: 'Image must be 5MB or smaller',
+            code: 'FILE_TOO_LARGE',
+          });
+        }
+        if (err) return next(err);
+        return uploadCampaignImageHandler(req, res);
+      });
+    });
+    app.put(`${prefix}/campaigns/:id`, rateLimiter, ...guard, requireScope('campaigns:write'), updateCampaign);
+    app.delete(`${prefix}/campaigns/:id`, rateLimiter, ...guard, requireScope('campaigns:write'), deleteCampaign);
     app.put(`${prefix}/campaigns/:id`, rateLimiter, requireApiKey, updateCampaign);
+    app.put(`${prefix}/campaigns/:id/publish`, rateLimiter, requireApiKey, publishCampaign);
+    app.put(`${prefix}/campaigns/:id/archive`, rateLimiter, requireApiKey, archiveCampaign);
     app.delete(`${prefix}/campaigns/:id`, rateLimiter, requireApiKey, deleteCampaign);
+    app.put(`${prefix}/campaigns/:id`, rateLimiter, ...guard, updateCampaign);
+    app.put(`${prefix}/campaigns/:id/publish`, rateLimiter, ...guard, publishCampaign);
+    app.put(`${prefix}/campaigns/:id/archive`, rateLimiter, ...guard, archiveCampaign);
+    app.delete(`${prefix}/campaigns/:id`, rateLimiter, ...guard, deleteCampaign);
+
+    app.post(`${prefix}/admin/api-keys`, rateLimiter, requireMasterKey, createApiKeyHandler);
+    app.get(`${prefix}/admin/api-keys`, rateLimiter, requireMasterKey, listApiKeysHandler);
+    app.delete(`${prefix}/admin/api-keys/:id`, rateLimiter, requireMasterKey, revokeApiKeyHandler);
+    app.put(
+      `${prefix}/admin/api-keys/:id/rotate`,
+      rateLimiter,
+      requireMasterKey,
+      rotateApiKeyHandler,
+    );
+
+    // Admin dashboard and campaign management (Issue #467)
+    app.get(`${prefix}/admin/dashboard`, rateLimiter, requireMasterKey, getAdminDashboard);
+    app.get(`${prefix}/admin/campaigns`, rateLimiter, requireMasterKey, listAdminCampaigns);
+
+    // Tenant usage metering (Issue #574)
+    app.get(`${prefix}/usage`, rateLimiter, ...guard, (req, res) => {
+      const orgId = req.auth?.orgId;
+      if (!orgId) {
+        return res.status(403).json({
+          error: 'Usage data is scoped to org-linked API keys.',
+          code: 'NO_ORG_CONTEXT',
+        });
+      }
+      const usage = usageMeteringService.getOrgUsage(orgId);
+      return res.json({ orgId, usage });
+    });
+
+    app.get(`${prefix}/admin/usage`, rateLimiter, requireMasterKey, (_req, res) => {
+      const rows = usageMeteringService.adminExport();
+      return res.json({ usage: rows });
+    });
+
+    app.put(`${prefix}/admin/usage/quotas`, rateLimiter, requireMasterKey, (req, res) => {
+      const {
+        orgId,
+        resource,
+        softLimit = null,
+        hardLimit = null,
+        windowSeconds = 3600,
+      } = req.body ?? {};
+      if (!orgId || !resource) {
+        return res.status(400).json({
+          error: 'orgId and resource are required',
+          code: 'VALIDATION_ERROR',
+        });
+      }
+      const quota = usageRepository.upsertQuota({
+        orgId,
+        resource,
+        softLimit,
+        hardLimit,
+        windowSeconds,
+      });
+      return res.json(quota);
+    });
+
+    // Job dead-letter inspection / requeue (Issue #286)
+    app.get(`${prefix}/jobs/failed`, rateLimiter, ...guard, listFailedJobsHandler);
+    app.post(`${prefix}/jobs/retry/:id`, rateLimiter, ...guard, retryFailedJobHandler);
+
+    // Durable job queue DLQ admin — inspect and replay dead jobs (#565)
+    app.get(`${prefix}/admin/jobs/dlq`, rateLimiter, requireMasterKey, (req, res) => {
+      const limit = Math.min(parseInt(/** @type {any} */ (req.query.limit)) || 100, 500);
+      const offset = Math.max(parseInt(/** @type {any} */ (req.query.offset)) || 0, 0);
+      const items = jobQueueStore.listDead({ limit, offset });
+      const total = jobQueueStore.countDead();
+      return res.json({ data: items, pagination: { total, count: items.length, limit, offset } });
+    });
+
+    app.post(`${prefix}/admin/jobs/:id/replay`, rateLimiter, requireMasterKey, async (req, res) => {
+      const job = jobQueueStore.getById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+      }
+      durableJobQueue.enqueue(job.type, job.payload);
+      jobQueueStore.removeById(job.id);
+      recordAuditEntry(req, { action: 'replay', entity: 'durableJob', entityId: job.id });
+      return res.status(202).json({ requeued: true, job: { id: job.id, type: job.type } });
+    });
+
+    // Webhook routes (Issue #287)
+    app.post(`${prefix}/webhooks`, rateLimiter, ...guard, (req, res) => {
+      const { url, events, secret } = req.body;
+      if (!url || !Array.isArray(events) || events.length === 0) {
+        return res.status(400).json({
+          error: 'Invalid webhook payload',
+          code: 'VALIDATION_ERROR',
+          details: ['url and events array are required'],
+        });
+      }
+      const webhook = webhookRepository.create({ url, events, secret });
+      recordAuditEntry(req, {
+        action: 'create',
+        entity: 'webhook',
+        entityId: webhook.id,
+        diff: { after: webhook },
+      });
+      return res.status(201).json(webhook);
+    });
+
+    app.get(`${prefix}/webhooks`, rateLimiter, ...guard, (req, res) => {
+      const webhooks = webhookRepository.list();
+      return res.json(paginateItems(webhooks, req.query));
+    });
+
+    app.get(`${prefix}/webhooks/:id`, rateLimiter, ...guard, (req, res) => {
+      const webhook = webhookRepository.getById(req.params.id);
+      if (!webhook) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      return res.json(webhook);
+    });
+
+    app.put(`${prefix}/webhooks/:id`, rateLimiter, ...guard, (req, res) => {
+      const { url, events, active } = req.body;
+      const before = webhookRepository.getById(req.params.id);
+      if (!before) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      const updates = {};
+      if (url !== undefined) updates.url = url;
+      if (events !== undefined) updates.events = events;
+      if (active !== undefined) updates.active = active;
+      const webhook = webhookRepository.update(req.params.id, updates);
+      recordAuditEntry(req, {
+        action: 'update',
+        entity: 'webhook',
+        entityId: webhook.id,
+        diff: { before, after: webhook },
+      });
+      return res.json(webhook);
+    });
+
+    app.delete(`${prefix}/webhooks/:id`, rateLimiter, ...guard, (req, res) => {
+      const before = webhookRepository.getById(req.params.id);
+      const deleted = webhookRepository.delete(req.params.id);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      recordAuditEntry(req, {
+        action: 'delete',
+        entity: 'webhook',
+        entityId: req.params.id,
+        diff: before ? { before } : null,
+      });
+      return res.status(204).end();
+    });
+
+    app.get(`${prefix}/webhooks/:id/deliveries`, rateLimiter, ...guard, (req, res) => {
+      const webhook = webhookRepository.getById(req.params.id);
+      if (!webhook) {
+        return res.status(404).json({ error: 'Webhook not found', code: 'WEBHOOK_NOT_FOUND' });
+      }
+      const deliveries = webhookRepository.listDeliveries(req.params.id, {
+        limit: parseInt(req.query.limit) || 100,
+      });
+      return res.json(paginateItems(deliveries, req.query));
+    });
+
+    // Referral routes (Issue #350)
+    app.post(`${prefix}/campaigns/:id/referrals`, rateLimiter, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+
+      const { referrerAddress, refereeAddress } = req.body ?? {};
+      if (!referrerAddress || typeof referrerAddress !== 'string') {
+        return res
+          .status(400)
+          .json({ error: 'referrerAddress is required', code: 'VALIDATION_ERROR' });
+      }
+      if (!refereeAddress || typeof refereeAddress !== 'string') {
+        return res
+          .status(400)
+          .json({ error: 'refereeAddress is required', code: 'VALIDATION_ERROR' });
+      }
+      if (referrerAddress === refereeAddress) {
+        return res.status(400).json({
+          error: 'referrerAddress and refereeAddress must be different',
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      const referral = referralRepository.create({
+        campaignId: req.params.id,
+        referrerAddress: referrerAddress.trim(),
+        refereeAddress: refereeAddress.trim(),
+      });
+
+      if (!referral) {
+        return res.status(409).json({
+          error: 'Referee already attributed to a referrer for this campaign',
+          code: 'REFERRAL_DUPLICATE',
+        });
+      }
+
+      return res.status(201).json(referral);
+    });
+
+    app.get(`${prefix}/campaigns/:id/referrals/:walletAddress`, rateLimiter, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+
+      const walletAddress = req.params.walletAddress.trim();
+      const referralCount = referralRepository.countByReferrer(req.params.id, walletAddress);
+      const bonusEarned = referralCount * (campaign.referralBonusPoints ?? 0);
+
+      return res.json({
+        walletAddress,
+        campaignId: String(campaign.id),
+        referralCount,
+        referralBonusPoints: campaign.referralBonusPoints ?? 0,
+        bonusEarned,
+      });
+    });
+
+    // Allowlist CSV import + proof routes (Issue #514)
+    const csvUpload = multer({
+      storage: multer.memoryStorage(),
+      limits: { fileSize: 5 * 1024 * 1024 /* 5 MB */ },
+    });
+
+    app.post(
+      `${prefix}/campaigns/:id/allowlist/import`,
+      rateLimiter,
+      ...guard,
+      requireScope('campaigns:write'),
+      csvUpload.single('file'),
+      async (req, res) => {
+        const campaign = campaignRepository.getById(req.params.id);
+        if (!campaign) {
+          return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+        }
+        if (!req.file && !req.body.csv) {
+          return res.status(400).json({ error: 'No CSV data provided', code: 'MISSING_CSV' });
+        }
+        const raw = req.file ? req.file.buffer.toString('utf8') : String(req.body.csv);
+        const { rows } = parseAllowlistCsv(raw);
+        if (rows.length === 0) {
+          return res.status(400).json({ error: 'CSV contains no addresses', code: 'EMPTY_CSV' });
+        }
+        if (rows.length > MAX_ALLOWLIST_ROWS) {
+          return res.status(400).json({
+            error: `CSV exceeds maximum of ${MAX_ALLOWLIST_ROWS} rows`,
+            code: 'CSV_TOO_LARGE',
+          });
+        }
+        const invalid = rows.filter((r) => !validateGAddress(r.address));
+        if (invalid.length > 0) {
+          return res.status(400).json({
+            error: 'CSV contains invalid Stellar addresses',
+            code: 'INVALID_ADDRESSES',
+            details: invalid.slice(0, 20).map((r) => ({ row: r.row, address: r.address })),
+          });
+        }
+        try {
+          const addresses = rows.map((r) => r.address);
+          const { root, proofs } = await generateAllowlist(addresses);
+          const addressEntries = rows.map((r) => ({
+            address: r.address,
+            label: r.label,
+            bonus_points: r.bonus_points ? Number(r.bonus_points) : undefined,
+            proof: proofs[r.address],
+          }));
+          allowlistRepository.upsertAllowlistEntries({ campaignId: req.params.id, addressEntries, merkleRootHex: root });
+          return res.status(201).json({
+            campaignId: String(req.params.id),
+            merkleRoot: root,
+            count: rows.length,
+          });
+        } catch (err) {
+          log.error({ err, campaignId: req.params.id }, 'Allowlist import failed');
+          return res.status(500).json({ error: 'Failed to generate allowlist', code: 'ALLOWLIST_ERROR' });
+        }
+      },
+    );
+
+    app.get(`${prefix}/campaigns/:id/allowlist`, rateLimiter, ...guard, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+      const entries = allowlistRepository.listAllowlist(req.params.id);
+      const merkleRoot = entries[0]?.merkleRoot ?? null;
+      return res.json({ campaignId: String(req.params.id), merkleRoot, count: entries.length, entries });
+    });
+
+    app.get(`${prefix}/campaigns/:id/allowlist/:address/proof`, rateLimiter, (req, res) => {
+      const campaign = campaignRepository.getById(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found', code: 'CAMPAIGN_NOT_FOUND' });
+      }
+      const address = req.params.address.trim();
+      if (!validateGAddress(address)) {
+        return res.status(400).json({ error: 'Invalid Stellar address', code: 'INVALID_ADDRESS' });
+      }
+      const row = allowlistRepository.getProof(req.params.id, address);
+      if (!row) {
+        return res.status(404).json({ error: 'Address not in allowlist', code: 'NOT_IN_ALLOWLIST' });
+      }
+      const proof = row.merkle_proof ? JSON.parse(row.merkle_proof) : null;
+      return res.json({ campaignId: String(req.params.id), address, merkleRoot: row.merkle_root, proof });
+    });
+
+    // Org + RBAC member management routes (Issue #608)
+    // Registered BEFORE the app.use(prefix, requireApiKey, ...) mounts so that
+    // master-key-only routes (POST /orgs) are not intercepted by the API-key
+    // guard that the variant/cohort/push routers apply at the prefix level.
+    const orgRouter = createOrgRoutes({
+      orgMemberRepository,
+      requireMasterKey,
+      requireApiKey,
+    });
+    app.use(prefix, rateLimiter, orgRouter);
+
+    // Audit log routes for organization-scoped audit logging and activity feeds (Issue #612)
+    const auditRouter = createAuditRouter({
+      auditLogService,
+      requireApiKey,
+    });
+    app.use(prefix, rateLimiter, auditRouter);
+
+    // Variant routes for A/B testing (Issue #624)
+    const variantRouter = createVariantRoutes({
+      variantRepo: variantRepository,
+      variantService,
+      campaignRepo: campaignRepository,
+    });
+    app.use(prefix, rateLimiter, ...guard, variantRouter);
+
+    // Cohort and retention analysis routes (Issue #623)
+    const cohortRouter = createCohortRoutes({
+      cohortService,
+      campaignRepo: campaignRepository,
+    });
+    app.use(prefix, rateLimiter, ...guard, cohortRouter);
+
+    // Web Push subscription routes (Issue #619)
+    const pushRouter = createPushRoutes({
+      repository: pushSubscriptionRepository,
+      service: webPushService,
+    });
+    app.use(prefix, rateLimiter, requireApiKey, pushRouter);
+
+    // Organization and team member invitation routes (Issue #609)
+    const organizationRouter = createOrganizationRoutes(dal);
+    app.use(`${prefix}/organizations`, rateLimiter, requireApiKey, organizationRouter);
+    app.use(prefix, rateLimiter, ...guard, pushRouter);
+
+    // Feature flag system routes (Issue #625)
+    const featureFlagService = createFeatureFlagService({ featureFlagRepository: dal.featureFlags });
+    const featureFlagRouter = createFeatureFlagRoutes({ featureFlagService });
+    app.use(`${prefix}/feature-flags`, rateLimiter, featureFlagRouter);
   }
 
   registerApiRoutes(API_V1_PREFIX);
   registerApiRoutes(LEGACY_API_PREFIX);
+
+  // Dynamic sitemap.xml for SEO — lists all public (non-hidden, active) campaign pages
+  app.get('/sitemap.xml', rateLimiter, (req, res) => {
+    const siteUrl =
+      (process.env.SITE_URL || '').replace(/\/+$/, '') || `${req.protocol}://${req.get('host')}`;
+
+    const staticPaths = ['/', '/explore', '/about'];
+    const campaigns = campaignRepository.list({ active: true });
+
+    const urlEntries = [
+      ...staticPaths.map(
+        (p) =>
+          `<url><loc>${siteUrl}${p}</loc><changefreq>daily</changefreq><priority>${p === '/' || p === '/explore' ? '1.0' : '0.7'}</priority></url>`,
+      ),
+      ...campaigns.map(
+        (c) =>
+          `<url><loc>${siteUrl}/campaign/${encodeURIComponent(c.id)}</loc><lastmod>${c.updatedAt ? new Date(c.updatedAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)}</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>`,
+      ),
+    ];
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urlEntries.join('\n')}\n</urlset>`;
+
+    res
+      .set('Content-Type', 'application/xml; charset=utf-8')
+      .set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
+      .send(xml);
+  });
 
   // Central error handler — must be registered after all routes
   app.use(errorHandler);
@@ -673,9 +2128,54 @@ export async function startServer(options = {}) {
   const app = await createApp(options);
   const port = options.port ?? process.env.PORT ?? DEFAULT_PORT;
 
-  return app.listen(port, () => {
+  const server = app.listen(port, () => {
     log.info({ port }, 'Trivela API running');
   });
+
+  // Initialize WebSocket server if not disabled
+  if (!options.disableWebSocket && process.env.ENABLE_WEBSOCKET !== 'false') {
+    try {
+      initializeWebSocket(server, {
+        path: process.env.WEBSOCKET_PATH || '/ws',
+      });
+      log.info('WebSocket server initialized on /ws');
+    } catch (error) {
+      log.error({ error }, 'Failed to initialize WebSocket server');
+    }
+  }
+
+  // ── Graceful shutdown (issue #650) ─────────────────────────────────────────
+  const SHUTDOWN_GRACE_MS = normalizePositiveInteger(process.env.SHUTDOWN_GRACE_MS, 15_000);
+
+  let shuttingDown = false;
+
+  async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info({ signal, graceMs: SHUTDOWN_GRACE_MS }, 'graceful shutdown started');
+
+    const forceTimer = setTimeout(() => {
+      log.error('graceful shutdown timed out — forcing exit');
+      process.exit(1);
+    }, SHUTDOWN_GRACE_MS);
+    if (typeof forceTimer.unref === 'function') forceTimer.unref();
+
+    await new Promise((resolve) => server.close(resolve));
+
+    stopUsageFlush();
+    await usageMeteringService.flushToDb().catch((err) => log.warn({ err }, 'usage flush warning'));
+
+    await shutdownTracing().catch((err) => log.warn({ err }, 'OTel shutdown warning'));
+
+    log.info('graceful shutdown complete');
+    clearTimeout(forceTimer);
+    process.exit(0);
+  }
+
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+
+  return server;
 }
 
 const isExecutedDirectly =

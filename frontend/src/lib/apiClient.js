@@ -49,7 +49,11 @@ async function request(url, options = {}) {
 
   if (!response.ok) {
     let body;
-    try { body = await response.json(); } catch { /* ignore */ }
+    try {
+      body = await response.json();
+    } catch {
+      /* ignore */
+    }
     const message =
       body?.error ?? body?.message ?? `HTTP ${response.status}: ${response.statusText}`;
     throw new ApiError(message, response.status, body);
@@ -88,6 +92,19 @@ async function getCampaignById(id) {
   return request(apiUrl(`/api/v1/campaigns/${id}`));
 }
 
+/**
+ * @param {string | number} id
+ * @param {{ range?: string, from?: string, to?: string }} [params]
+ */
+async function getCampaignStats(id, params = {}) {
+  const qs = new URLSearchParams();
+  if (params.range) qs.set('range', params.range);
+  if (params.from) qs.set('from', params.from);
+  if (params.to) qs.set('to', params.to);
+  const url = apiUrl(`/api/v1/campaigns/${id}/stats`) + (qs.toString() ? `?${qs}` : '');
+  return request(url);
+}
+
 /** @param {string} slug */
 async function getCampaignBySlug(slug) {
   return request(apiUrl(`/api/v1/campaigns/by-slug/${encodeURIComponent(slug)}`));
@@ -114,6 +131,33 @@ async function updateCampaign(id, body) {
 /** @param {string | number} id */
 async function deleteCampaign(id) {
   return request(apiUrl(`/api/v1/campaigns/${id}`), { method: 'DELETE' });
+}
+
+// ── Leaderboard endpoints ─────────────────────────────────────────────────────
+
+/**
+ * @param {string | number} campaignId
+ * @param {{ page?: number, limit?: number, q?: string }} [params]
+ */
+async function getCampaignLeaderboard(campaignId, params = {}) {
+  const qs = new URLSearchParams();
+  if (params.page) qs.set('page', String(params.page));
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.q) qs.set('q', params.q);
+  const url =
+    apiUrl(`/api/v1/campaigns/${campaignId}/leaderboard`) + (qs.toString() ? `?${qs}` : '');
+  return /** @type {Promise<{ data: any[], pagination: object }>} */ (request(url));
+}
+
+/**
+ * @param {string | number} campaignId
+ * @param {string} walletAddress
+ */
+async function getParticipantRank(campaignId, walletAddress) {
+  const url =
+    apiUrl(`/api/v1/campaigns/${campaignId}/leaderboard/rank`) +
+    `?wallet=${encodeURIComponent(walletAddress)}`;
+  return request(url);
 }
 
 // ── Config endpoint ───────────────────────────────────────────────────────────
@@ -190,15 +234,41 @@ async function getAnalyticsDashboard(params = {}) {
   return request(url);
 }
 
+// ── Explore / discovery endpoints ─────────────────────────────────────────────
+
+/** @param {{ limit?: number }} [params] */
+async function getTrendingCampaigns(params = {}) {
+  const qs = new URLSearchParams();
+  qs.set('limit', String(params.limit ?? 6));
+  const url = apiUrl('/api/v1/campaigns/trending') + `?${qs}`;
+  return /** @type {Promise<{ data: any[] }>} */ (request(url));
+}
+
+/**
+ * @param {{ limit?: number }} [params]
+ */
+async function getNewCampaigns(params = {}) {
+  return getCampaigns({
+    active: true,
+    sort: 'created_at',
+    order: 'desc',
+    limit: params.limit ?? 6,
+    page: 1,
+  });
+}
+
 // ── Exports ───────────────────────────────────────────────────────────────────
 
 export const apiClient = {
   getCampaigns,
   getCampaignById,
+  getCampaignStats,
   getCampaignBySlug,
   createCampaign,
   updateCampaign,
   deleteCampaign,
+  getCampaignLeaderboard,
+  getParticipantRank,
   getConfig,
   getNotifications,
   markNotificationRead,
@@ -208,6 +278,8 @@ export const apiClient = {
   getAuditLog,
   exportAuditLog,
   getAnalyticsDashboard,
+  getTrendingCampaigns,
+  getNewCampaigns,
 };
 
 export { ApiError };

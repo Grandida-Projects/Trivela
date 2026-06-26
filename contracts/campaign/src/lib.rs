@@ -5,6 +5,7 @@
 //!
 //! Events:
 //! - `register`: topics `(register, participant)`, data `()`
+//! - `referred`: topics `(referred, participant, referrer)`, data `()`
 //! - `active`: topics `(active,)`, data `active: bool`
 //! - `window`: topics `(window,)`, data `(start: u64, end: u64)`
 //! - `maxcap`: topics `(maxcap,)`, data `max_cap: u64`
@@ -33,8 +34,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, symbol_short, Address, Bytes, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    Symbol, Vec, vec,
 };
 
 #[contracterror]
@@ -49,9 +50,30 @@ pub enum Error {
     UnsupportedMigration = 105,
     InvalidAdminNonce = 106,
     InvalidWindow = 107,
+    NoPendingAdmin = 108,
+    SelfReferral = 109,
+    ReferrerNotRegistered = 110,
 }
 
 contractmeta!(key = "Description", val = "Trivela campaign configuration");
+
+// ── Instance-storage TTL (issue #279) ────────────────────────────────────────
+//
+// Mainnet ledgers close every ~5 seconds, so the prior `extend_ttl(50, 100)`
+// literals expired instance storage roughly 8 minutes after the last
+// mutation. These constants size the lifetime for production; tests override
+// with the small values via `cfg(test)` so suites don't churn ledger budget.
+// See `docs/TTL_STRATEGY.md` for the full rationale.
+
+#[cfg(not(test))]
+pub const TTL_THRESHOLD: u32 = 100_000;
+#[cfg(not(test))]
+pub const TTL_EXTEND_TO: u32 = 518_400;
+
+#[cfg(test)]
+pub const TTL_THRESHOLD: u32 = 50;
+#[cfg(test)]
+pub const TTL_EXTEND_TO: u32 = 100;
 
 const ADMIN: Symbol = symbol_short!("admin");
 const CAMPAIGN_ACTIVE: Symbol = symbol_short!("active");
@@ -69,6 +91,59 @@ const SET_ACTIVE_EVENT: Symbol = symbol_short!("active");
 const SET_WINDOW_EVENT: Symbol = symbol_short!("window");
 const SET_MAX_CAP_EVENT: Symbol = symbol_short!("maxcap");
 const SET_MERKLE_ROOT_EVENT: Symbol = symbol_short!("merkle");
+
+// ── On-chain referral tracking (issue #455) ──────────────────────────────────
+//
+// `(REFERRAL, referee) -> referrer` maps each referred participant to the
+// already-registered participant who referred them. `(REFERRAL_COUNT, referrer)
+// -> u64` keeps a running tally so the `referral_count` view is O(1) rather than
+// scanning every referee. Both live in PERSISTENT storage alongside the
+// per-participant records they mirror (see #280).
+const REFERRAL: Symbol = symbol_short!("referral");
+const REFERRAL_COUNT: Symbol = symbol_short!("refcnt");
+const REFERRED_EVENT: Symbol = symbol_short!("referred");
+
+// ── Activity log ring buffer (issue #453) ────────────────────────────────────
+//
+// On-chain ring buffer of recent campaign events for light clients to verify
+// activity without running a full indexer. Stores the last N events in a
+// fixed-size vector that evicts oldest entries when full.
+const ACTIVITY_LOG: Symbol = symbol_short!("actlog");
+const ACTIVITY_LOG_SIZE: Symbol = symbol_short!("actsize");
+const DEFAULT_ACTIVITY_LOG_SIZE: u32 = 50;
+const MIN_ACTIVITY_LOG_SIZE: u32 = 10;
+const MAX_ACTIVITY_LOG_SIZE: u32 = 200;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ActivityKind {
+    Register,
+    Credit,
+    Claim,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ActivityEntry {
+    pub kind: ActivityKind,
+    pub actor: Address,
+    pub amount: Option<u64>,
+    pub ledger: u32,
+}
+
+// #280 — TTL thresholds for the per-participant persistent storage
+// entries. Values are deliberately modest in this initial migration:
+// every register call refreshes its own key without taking on the
+// expense of much-longer extension windows. Production deployers
+// should bump these via a future admin-only setter when traffic
+// patterns are known (e.g. lengthen to a full campaign window once
+// max_cap and end_time are public).
+const PARTICIPANT_TTL_THRESHOLD: u32 = 100;
+const PARTICIPANT_TTL_EXTEND_TO: u32 = 500;
+// ── 2-step admin transfer (issue #281) ───────────────────────────────────────
+const PENDING_ADMIN: Symbol = symbol_short!("padmin");
+const ADMIN_PROPOSED_EVENT: Symbol = symbol_short!("aproposed");
+const ADMIN_ACCEPTED_EVENT: Symbol = symbol_short!("aaccepted");
 
 #[contract]
 pub struct CampaignContract;
@@ -99,6 +174,36 @@ fn verify_merkle_proof(
     &computed == root
 }
 
+/// Append an activity entry to the ring buffer, evicting oldest if full.
+fn log_activity(env: &Env, kind: ActivityKind, actor: Address, amount: Option<u64>) {
+    let max_size: u32 = env
+        .storage()
+        .instance()
+        .get(&ACTIVITY_LOG_SIZE)
+        .unwrap_or(DEFAULT_ACTIVITY_LOG_SIZE);
+    
+    let mut log: Vec<ActivityEntry> = env
+        .storage()
+        .instance()
+        .get(&ACTIVITY_LOG)
+        .unwrap_or_else(|| vec![env]);
+    
+    let entry = ActivityEntry {
+        kind,
+        actor,
+        amount,
+        ledger: env.ledger().sequence(),
+    };
+    
+    // If buffer is at max size, remove oldest entry (first element)
+    if log.len() >= max_size {
+        log.remove(0);
+    }
+    
+    log.push_back(entry);
+    env.storage().instance().set(&ACTIVITY_LOG, &log);
+}
+
 fn require_admin_with_nonce(env: &Env, admin: &Address, nonce: u64) -> Result<(), Error> {
     admin.require_auth();
     let stored: Address = env.storage().instance().get(&ADMIN).unwrap();
@@ -126,7 +231,9 @@ impl CampaignContract {
             .instance()
             .set(&SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
         env.storage().instance().set(&ADMIN_NONCE, &0u64);
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -154,8 +261,29 @@ impl CampaignContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION, &CURRENT_SCHEMA_VERSION);
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(CURRENT_SCHEMA_VERSION)
+    }
+
+    /// Replace the contract WASM in-place without resetting participant state.
+    ///
+    /// Calls `contract_update_current_contract_wasm` with the supplied hash of
+    /// the new WASM blob (must already be uploaded via
+    /// `Env::deployer().upload_contract_wasm`).  Participant records in
+    /// persistent storage survive because Soroban WASM-only upgrades never
+    /// touch storage.  Requires admin auth and a valid nonce so upgrades are
+    /// replay-safe.
+    ///
+    /// Typical workflow (issue #518):
+    ///   1. Upload new WASM → obtain `new_wasm_hash`.
+    ///   2. Call `upgrade(admin, nonce, new_wasm_hash)`.
+    ///   3. If storage layout changed, call `migrate(admin, target_version)`.
+    pub fn upgrade(env: Env, admin: Address, nonce: u64, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        require_admin_with_nonce(&env, &admin, nonce)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 
     /// Set registration time window (admin only).
@@ -177,7 +305,9 @@ impl CampaignContract {
         env.storage().instance().set(&START_TIME, &start);
         env.storage().instance().set(&END_TIME, &end);
         env.events().publish((SET_WINDOW_EVENT,), (start, end));
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -209,7 +339,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&CAMPAIGN_ACTIVE, &active);
         env.events().publish((SET_ACTIVE_EVENT,), active);
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -218,7 +350,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&MAX_CAP, &max_cap);
         env.events().publish((SET_MAX_CAP_EVENT,), max_cap);
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -236,7 +370,9 @@ impl CampaignContract {
         require_admin_with_nonce(&env, &admin, nonce)?;
         env.storage().instance().set(&MERKLE_ROOT, &root);
         env.events().publish((SET_MERKLE_ROOT_EVENT,), root.clone());
-        env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(())
     }
 
@@ -255,12 +391,23 @@ impl CampaignContract {
     ///           `leaf` to the stored root.  Pass an empty `Vec` when no root
     ///           is configured.
     ///
+    /// `referrer` – optional address of an already-registered participant who
+    ///           referred this registrant (issue #455). When supplied, the
+    ///           contract records `(referee -> referrer)`, increments the
+    ///           referrer's tally, and emits a `referred` event so the backend
+    ///           indexer can credit the referral bonus trustlessly. A referrer
+    ///           cannot refer themselves (`Error::SelfReferral`) and must
+    ///           already be registered (`Error::ReferrerNotRegistered`).
+    ///           Referral is recorded only on first registration; passing a
+    ///           referrer on a repeat call is a no-op.
+    ///
     /// Returns `true` on first registration, `false` if already registered.
     pub fn register(
         env: Env,
         participant: Address,
         leaf: BytesN<32>,
         proof: Vec<BytesN<32>>,
+        referrer: Option<Address>,
     ) -> Result<bool, Error> {
         participant.require_auth();
 
@@ -288,14 +435,38 @@ impl CampaignContract {
             }
         }
 
+        // #280 — Participant records live in PERSISTENT storage.
+        // Instance storage is shared with the contract code and caps
+        // at ~64KB total, which would brick a high-traffic campaign
+        // somewhere north of ~1.8k participants. Per-user data
+        // belongs in persistent storage where every key has its own
+        // TTL slot.
         let key = (PARTICIPANT, participant.clone());
         if env
             .storage()
-            .instance()
+            .persistent()
             .get::<_, bool>(&key)
             .unwrap_or(false)
         {
             return Ok(false);
+        }
+
+        // On-chain referral validation (issue #455). A referrer must be an
+        // already-registered participant and cannot be the registrant
+        // themselves. Validated before any state mutation so an invalid
+        // referrer aborts the whole registration atomically.
+        if let Some(referrer) = referrer.clone() {
+            if referrer == participant {
+                return Err(Error::SelfReferral);
+            }
+            let referrer_registered: bool = env
+                .storage()
+                .persistent()
+                .get(&(PARTICIPANT, referrer))
+                .unwrap_or(false);
+            if !referrer_registered {
+                return Err(Error::ReferrerNotRegistered);
+            }
         }
 
         let max_cap: u64 = env.storage().instance().get(&MAX_CAP).unwrap_or(0);
@@ -310,7 +481,18 @@ impl CampaignContract {
             }
         }
 
-        env.storage().instance().set(&key, &true);
+        env.storage().persistent().set(&key, &true);
+        // Extend the new persistent key's TTL alongside the write
+        // so the participant record stays alive across the campaign
+        // window. Threshold / extend-to values mirror the existing
+        // pattern used elsewhere in the workspace; the deployer can
+        // tune via a future admin-only setter without changing the
+        // storage tier.
+        env.storage().persistent().extend_ttl(
+            &key,
+            PARTICIPANT_TTL_THRESHOLD,
+            PARTICIPANT_TTL_EXTEND_TO,
+        );
 
         let count: u64 = env
             .storage()
@@ -321,18 +503,111 @@ impl CampaignContract {
             .instance()
             .set(&PARTICIPANT_COUNT, &(count + 1));
 
-        env.events().publish((REGISTER_EVENT, participant), ());
+        env.events()
+            .publish((REGISTER_EVENT, participant.clone()), ());
 
+        // Log the registration to the activity ring buffer (issue #453)
+        log_activity(&env, ActivityKind::Register, participant.clone(), None);
+
+        // Record the referral edge and bump the referrer's tally (issue #455).
+        // Only reached on first-time registration with a validated referrer.
+        if let Some(referrer) = referrer {
+            let referral_key = (REFERRAL, participant.clone());
+            env.storage().persistent().set(&referral_key, &referrer);
+            env.storage().persistent().extend_ttl(
+                &referral_key,
+                PARTICIPANT_TTL_THRESHOLD,
+                PARTICIPANT_TTL_EXTEND_TO,
+            );
+
+            let count_key = (REFERRAL_COUNT, referrer.clone());
+            let referral_total: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&count_key, &(referral_total + 1));
+            env.storage().persistent().extend_ttl(
+                &count_key,
+                PARTICIPANT_TTL_THRESHOLD,
+                PARTICIPANT_TTL_EXTEND_TO,
+            );
+
+            env.events()
+                .publish((REFERRED_EVENT, participant, referrer), ());
+        }
+
+        // Instance storage still holds aggregate state
+        // (PARTICIPANT_COUNT, ADMIN, etc.) so keep its TTL fresh
+        // too.
         env.storage().instance().extend_ttl(50, 100);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
         Ok(true)
     }
 
-    /// Check if a participant is registered.
+    /// Deregister a participant.
+    ///
+    /// Checks liveness/window: if end_time is u64::MAX, checks if campaign is active;
+    /// otherwise, checks if current timestamp <= end_time.
+    pub fn deregister(env: Env, participant: Address) -> Result<bool, Error> {
+        participant.require_auth();
+
+        let end_time: u64 = env.storage().instance().get(&END_TIME).unwrap_or(u64::MAX);
+        if end_time != u64::MAX {
+            let now = env.ledger().timestamp();
+            if now > end_time {
+                return Err(Error::OutsideTimeWindow);
+            }
+        } else {
+            let active: bool = env
+                .storage()
+                .instance()
+                .get(&CAMPAIGN_ACTIVE)
+                .unwrap_or(false);
+            if !active {
+                return Err(Error::CampaignInactive);
+            }
+        }
+
+        Ok(do_deregister(&env, participant))
+    }
+
+    /// Deregister a participant by the admin.
+    ///
+    /// Bypasses time window and liveness checks. Requires admin auth and nonce validation.
+    pub fn admin_deregister(
+        env: Env,
+        admin: Address,
+        nonce: u64,
+        participant: Address,
+    ) -> Result<bool, Error> {
+        require_admin_with_nonce(&env, &admin, nonce)?;
+        Ok(do_deregister(&env, participant))
+    }
+
+    /// Check if a participant is registered. (#280) Reads from
+    /// persistent storage where participant records live.
     pub fn is_participant(env: Env, participant: Address) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .get(&(PARTICIPANT, participant))
             .unwrap_or(false)
+    }
+
+    /// Return the referrer recorded for `participant` at registration, or
+    /// `None` if they registered without one (issue #455).
+    pub fn referrer_of(env: Env, participant: Address) -> Option<Address> {
+        env.storage().persistent().get(&(REFERRAL, participant))
+    }
+
+    /// Return how many participants registered with `referrer` as their
+    /// on-chain referrer (issue #455). Defaults to `0` for an address that
+    /// has never referred anyone.
+    pub fn referral_count(env: Env, referrer: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&(REFERRAL_COUNT, referrer))
+            .unwrap_or(0)
     }
 
     /// Check if campaign is active.
@@ -360,7 +635,157 @@ impl CampaignContract {
     pub fn admin_nonce(env: Env) -> u64 {
         env.storage().instance().get(&ADMIN_NONCE).unwrap_or(0)
     }
+
+    // ── Admin rotation (issue #281) ──────────────────────────────────────────
+
+    /// Return the current admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&ADMIN).unwrap()
+    }
+
+    /// Return the pending admin address proposed by the current admin, if any.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PENDING_ADMIN)
+    }
+
+    /// Propose a new admin (current admin only). The transfer does not take
+    /// effect until `accept_admin` is called by the new admin.
+    pub fn propose_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        current_admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        if stored_admin != current_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&PENDING_ADMIN, &new_admin);
+        env.events()
+            .publish((ADMIN_PROPOSED_EVENT, current_admin), new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Accept admin role. Caller MUST be the address that the current admin
+    /// previously proposed via `propose_admin`. Clears the pending slot on
+    /// success.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN)
+            .ok_or(Error::NoPendingAdmin)?;
+        if pending != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&ADMIN, &new_admin);
+        env.storage().instance().remove(&PENDING_ADMIN);
+        env.events().publish((ADMIN_ACCEPTED_EVENT,), new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Cancel an in-flight admin transfer (current admin only).
+    pub fn cancel_admin_transfer(env: Env, current_admin: Address) -> Result<(), Error> {
+        current_admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        if stored_admin != current_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
+    // ── Activity log (issue #453) ────────────────────────────────────────────
+
+    /// Return the activity log ring buffer in chronological order (oldest first).
+    pub fn activity_log(env: Env) -> Vec<ActivityEntry> {
+        env.storage()
+            .instance()
+            .get(&ACTIVITY_LOG)
+            .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Set the maximum size of the activity log ring buffer (admin only).
+    /// Must be between MIN_ACTIVITY_LOG_SIZE (10) and MAX_ACTIVITY_LOG_SIZE (200).
+    pub fn set_activity_log_size(
+        env: Env,
+        admin: Address,
+        nonce: u64,
+        size: u32,
+    ) -> Result<(), Error> {
+        require_admin_with_nonce(&env, &admin, nonce)?;
+        if size < MIN_ACTIVITY_LOG_SIZE || size > MAX_ACTIVITY_LOG_SIZE {
+            return Err(Error::Unauthorized); // Reuse error code for invalid range
+        }
+        
+        // If reducing size, trim the log to fit
+        let mut log: Vec<ActivityEntry> = env
+            .storage()
+            .instance()
+            .get(&ACTIVITY_LOG)
+            .unwrap_or_else(|| vec![&env]);
+        
+        while log.len() > size {
+            log.remove(0);
+        }
+        
+        env.storage().instance().set(&ACTIVITY_LOG, &log);
+        env.storage().instance().set(&ACTIVITY_LOG_SIZE, &size);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Get the configured activity log buffer size.
+    pub fn get_activity_log_size(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&ACTIVITY_LOG_SIZE)
+            .unwrap_or(DEFAULT_ACTIVITY_LOG_SIZE)
+    }
+}
+
+fn do_deregister(env: &Env, participant: Address) -> bool {
+    // #280 — Participant records live in PERSISTENT storage.
+    let key = (PARTICIPANT, participant.clone());
+    if !env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    env.storage().persistent().remove(&key);
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&PARTICIPANT_COUNT)
+        .unwrap_or(0);
+    if count > 0 {
+        env.storage()
+            .instance()
+            .set(&PARTICIPANT_COUNT, &(count - 1));
+    }
+    env.events()
+        .publish((Symbol::new(env, "deregister"), participant), ());
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    true
 }
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod fuzz_test;
