@@ -78,6 +78,7 @@ import { createSponsoredAccountRoutes } from './routes/sponsoredAccounts.js';
 import { createClaimableBalancesRoutes } from './routes/claimableBalances.js';
 import { createIndexReadRoutes } from './routes/indexRead.js';
 import { createSep10Routes, createRequireWalletAuth } from './routes/sep10.js';
+import { createZkInputsRoutes } from './routes/zkInputs.js';
 
 const DEFAULT_PORT = 3001;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
@@ -2173,6 +2174,10 @@ export async function createApp(options = {}) {
     jwtSecret: process.env.TRIVELA_JWT_SECRET,
     serverSecret: process.env.STELLAR_SECRET_KEY,
   });
+
+  // #543 — ZK proving inputs (public, no auth — secrets never leave the device)
+  const zkInputsRouter = createZkInputsRoutes({ campaignRepository });
+  app.use(API_V1_PREFIX, rateLimiter, zkInputsRouter);
 
   registerApiRoutes(API_V1_PREFIX);
   registerApiRoutes(LEGACY_API_PREFIX);
