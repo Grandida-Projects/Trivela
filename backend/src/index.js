@@ -46,6 +46,9 @@ import {
   MAX_IMAGE_SIZE_BYTES,
 } from './services/imageUpload.js';
 import { buildCampaignStats } from './services/campaignStatsService.js';
+import { createCampaignExportRoute } from './routes/campaignExport.js';
+import { createDeprecationMiddleware } from './middleware/deprecationNotice.js';
+import { DEPRECATION_REGISTRY } from './deprecations.js';
 import { generateAllowlist } from './lib/allowlist/merkle.js';
 import { parseAllowlistCsv, validateGAddress, MAX_ALLOWLIST_ROWS } from './lib/allowlist/csv.js';
 import { createEmbedRoute } from './routes/embed.js';
@@ -496,6 +499,7 @@ export async function createApp(options = {}) {
   app.use(compression({ threshold: 1024 }));
   app.use(cors(createCorsOptions(allowedOrigins)));
   app.use(securityHeaders);
+  app.use(createDeprecationMiddleware({ log }));
   app.use(traceparentMiddleware());
   app.use(requestLogger);
   app.use(express.json({ limit: jsonBodyLimit }));
@@ -1760,6 +1764,8 @@ export async function createApp(options = {}) {
     app.get(`${prefix}/campaigns/by-slug/:slug`, rateLimiter, getCampaignBySlug);
     app.get(`${prefix}/campaigns/:id`, rateLimiter, getCampaignById);
     app.get(`${prefix}/campaigns/:id/stats`, rateLimiter, getCampaignStats);
+    app.use(prefix, createCampaignExportRoute({ db: dal.db, campaignRepository, auditLogRepository, requireApiKey }));
+    app.get(`${prefix}/deprecations`, rateLimiter, (_req, res) => res.json({ deprecations: DEPRECATION_REGISTRY }));
     app.get(`${prefix}/audit-logs`, rateLimiter, ...guard, listAuditLogs);
     app.get(`${prefix}/admin/audit/verify`, rateLimiter, requireMasterKey, verifyAuditChain);
     app.get(`${prefix}/indexer/cursor`, rateLimiter, getIndexerCursorState);
